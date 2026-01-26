@@ -159,31 +159,12 @@ visualize_explanations(
 
 ### Fragment-Aware Message Passing
 
-The key innovation is separate linear transformations for intra-fragment and inter-fragment edges:
-
-```
-h_i^{l+1} = σ(W_root · h_i^l + Σ_{j∈N(i)} M(h_j^l, e_ij))
-
-where M(h_j, e_ij) = W_intra · h_j  if edge within fragment
-                   = W_inter · h_j  if edge crosses fragment boundary
-```
-
+The key innovation is separate linear transformations for intra-fragment and inter-fragment edges.
 This enables:
 1. **Interpretable attributions**: Fragment contributions sum to the prediction
 2. **Regularization**: L1 penalty on inter-fragment weights encourages local explanations
 3. **Transfer learning**: Encoder learns general fragment representations
 
-### Fragment Pooling
-
-After message passing, fragment embeddings are computed via:
-```
-z_f = Σ_{i∈f} h_i  (sum over atoms in fragment f)
-```
-
-Final prediction is the sum of fragment contributions:
-```
-y = Σ_f W_task · z_f
-```
 
 ## Data Sources
 
@@ -192,26 +173,11 @@ y = Σ_f W_task · z_f
 - **ChEMBL**: Aurora kinase bioactivity data
   - https://www.ebi.ac.uk/chembl/
 
-## Citation
 
-If you use this code, please cite:
-
-```bibtex
-@mastersthesis{halla2026seal,
-  title={Learning Molecular Representations for ADME Prediction and Interpretability: 
-         A Case Study on Aurora Kinase Inhibitors},
-  author={Halla, Achraf},
-  year={2026},
-  school={Bielefeld University},
-  type={M.Sc. Thesis}
-}
-```
 
 ## References
 
 - Musial et al. (2025). SEAL: Substructure-Explainable Active Learning for Molecular Property Prediction.
 - Liu et al. (2022). GraphBP: Generating 3D Molecules by 3D Molecular Generative Models.
 
-## License
 
-MIT License - see [LICENSE](LICENSE) for details.
