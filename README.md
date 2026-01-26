@@ -31,7 +31,7 @@ Extension of the original SEAL framework (Musial et al., 2025) with:
 
 ```bash
 # Clone the repository
-git clone https://github.com/username/seal-adme.git
+git clone https://github.com/achraf-halla/seal-adme.git
 cd seal-adme
 
 # Create conda environment (recommended)
