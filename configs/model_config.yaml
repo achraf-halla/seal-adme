@@ -1,0 +1,100 @@
+# Model and training configuration for SEAL-ADME
+
+# Model architecture
+model:
+  # Input feature dimension (from atom featurizer)
+  input_features: 25
+  
+  # Hidden layer dimension
+  hidden_features: 256
+  
+  # Number of message passing layers
+  num_layers: 4
+  
+  # Dropout rate
+  dropout: 0.1
+  
+  # Convolution type: 'seal' (GCN-based) or 'gin' (GIN-based)
+  conv_type: seal
+  
+  # Regularization
+  regularize_encoder: 1.0e-4      # L1 on inter-fragment weights
+  regularize_contribution: 0.5    # L1 on fragment contributions
+
+# Pretraining configuration (classification tasks)
+pretrain:
+  epochs: 50
+  batch_size: 64
+  lr: 1.0e-3
+  weight_decay: 1.0e-5
+  
+  # Samples per task per epoch (null = use minimum)
+  samples_per_task: 500
+  
+  # Gradient clipping
+  grad_clip: 1.0
+  
+  # Learning rate scheduler
+  lr_patience: 5
+  lr_factor: 0.5
+  
+  # Early stopping
+  early_stop_patience: 15
+
+# Fine-tuning configuration (regression tasks)
+finetune:
+  epochs: 120
+  batch_size: 64
+  lr: 3.0e-4
+  weight_decay: 1.0e-6
+  
+  # Loss weighting
+  mse_weight: 1.0
+  
+  # Gradient clipping
+  grad_clip: 1.0
+  
+  # Learning rate scheduler
+  lr_patience: 8
+  lr_factor: 0.5
+  
+  # Early stopping
+  early_stop_patience: 25
+  
+  # Task sampling strategy: 'round_robin' or 'proportional'
+  task_sampling: round_robin
+
+# Task definitions
+tasks:
+  pretrain:
+    # Classification tasks for pretraining
+    - hia_hou
+    - pgp_broccatelli
+    - bioavailability_ma
+    - lipophilicity_astrazeneca
+    - bbb_martins
+    - ppbr_az
+    - vdss_lombardo
+    - cyp2d6_veith
+    - cyp3a4_veith
+    - cyp2c9_veith
+    - cyp2d6_substrate_carbonmangels
+    - cyp3a4_substrate_carbonmangels
+    - cyp2c9_substrate_carbonmangels
+    - clearance_microsome_az
+    - clearance_hepatocyte_az
+  
+  finetune:
+    # Regression tasks for fine-tuning
+    - solubility_aqsoldb
+    - caco2
+    - half_life_obach
+    - AKA  # Aurora Kinase A
+    - AKB  # Aurora Kinase B
+
+# Inference settings
+inference:
+  batch_size: 128
+  extract_explanations: true
+  visualize: true
+  visualization_samples: 10
