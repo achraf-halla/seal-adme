@@ -109,6 +109,10 @@ def step_load_aurora(config: dict, output_dir: Path) -> dict:
         df_filtered = df_filtered.rename(columns={"canonical_smiles": "original_smiles"})
     if "target_chembl_id" in df_filtered.columns:
         df_filtered["target_chembl_id"] = df_filtered["target_chembl_id"].astype(str).str.strip().fillna("")
+    if "pchembl_value" in df_filtered.columns:
+        df_filtered = df_filtered.rename(columns={"pchembl_value": "Y"})
+        
+        
     else:
         df_filtered["target_chembl_id"] = ""
     def _map_task(tid: str) -> str:
@@ -130,7 +134,7 @@ def step_load_aurora(config: dict, output_dir: Path) -> dict:
         "standard_relation",
         "target_chembl_id",
         "standard_type",
-        "pchembl_value",
+        "Y",
         "assay_chembl_id",
         "assay_description",
         "assay_type",
