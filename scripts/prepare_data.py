@@ -84,21 +84,13 @@ def step_load_tdc(config: dict, output_dir: Path) -> dict:
 
 
 def step_load_aurora(config: dict, output_dir: Path) -> dict:
-    """Step 1b: Load Aurora kinase data from ChEMBL."""
     logger = logging.getLogger("load_aurora")
     logger.info("Loading Aurora kinase data from ChEMBL...")
-    
     loader = ChEMBLAuroraLoader(output_dir)
-    
-    # Find Aurora targets
     target_ids = loader.find_aurora_targets()
-    logger.info(f"Found {len(target_ids)} Aurora kinase targets")
-    
-    # Fetch activities
+    logger.info("Found %d Aurora kinase targets", len(target_ids))
     df = loader.fetch_activities(target_ids)
     loader.save(df, "raw_aurora.csv")
-    
-    # Apply filters
     chembl_config = config.get("chembl", {}).get("aurora_filters", {})
     df_filtered = filter_aurora_data(
         df,
@@ -107,43 +99,82 @@ def step_load_aurora(config: dict, output_dir: Path) -> dict:
         assay_type=chembl_config.get("assay_type", "B"),
         require_pchembl=chembl_config.get("require_pchembl", True)
     )
+    if df_filtered is None or len(df_filtered) == 0:
+        loader.save(df_filtered, "aurora_filtered.csv")
+        return {"raw_rows": len(df), "filtered_rows": 0, "targets": target_ids}
+    df_filtered = df_filtered.copy()
+    if "molecule_chembl_id" in df_filtered.columns:
+        df_filtered = df_filtered.rename(columns={"molecule_chembl_id": "Drug_ID"})
+    if "canonical_smiles" in df_filtered.columns:
+        df_filtered = df_filtered.rename(columns={"canonical_smiles": "original_smiles"})
+    if "target_chembl_id" in df_filtered.columns:
+        df_filtered["target_chembl_id"] = df_filtered["target_chembl_id"].astype(str).str.strip().fillna("")
+    else:
+        df_filtered["target_chembl_id"] = ""
+    def _map_task(tid: str) -> str:
+        if tid == "CHEMBL4722":
+            return "Aurora Kinase A"
+        if tid == "CHEMBL2185":
+            return "Aurora Kinase B"
+        if tid:
+            return f"Aurora_{tid}"
+        return "Aurora_Unknown"
+    df_filtered["task_name"] = df_filtered["target_chembl_id"].map(_map_task)
+    df_filtered["source"] = "Aurora"
+    df_filtered["task"] = "regression"
+    desired = [
+        "Drug_ID",
+        "original_smiles",
+        "standard_value",
+        "standard_units",
+        "standard_relation",
+        "target_chembl_id",
+        "standard_type",
+        "pchembl_value",
+        "assay_chembl_id",
+        "assay_description",
+        "assay_type",
+        "assay_organism",
+        "assay_parameters",
+        "task_name",
+        "source",
+        "task"
+    ]
+    existing = [c for c in desired if c in df_filtered.columns]
+    others = [c for c in df_filtered.columns if c not in existing]
+    df_filtered = df_filtered[existing + others]
     loader.save(df_filtered, "aurora_filtered.csv")
-    
-    return {
-        "raw_rows": len(df),
-        "filtered_rows": len(df_filtered),
-        "targets": target_ids
-    }
+    return {"raw_rows": len(df), "filtered_rows": len(df_filtered), "targets": target_ids}
 
 
 def step_validate(config: dict, input_dir: Path, output_dir: Path) -> dict:
-    """Step 2: Validate and canonicalize SMILES."""
     logger = logging.getLogger("validate")
     logger.info("Validating SMILES...")
-    
-    preprocessor = DataPreprocessor(
-        input_dir=input_dir,
-        output_dir=output_dir
-    )
-    
+    preprocessor = DataPreprocessor(input_dir=input_dir, output_dir=output_dir)
     results = {}
-    for csv_file in input_dir.glob("*.csv"):
+    paths = set()
+    for p in input_dir.glob("*filtered.csv"):
+        paths.add(p)
+    raw_pre = input_dir / "raw_pretrain.csv"
+    raw_fine = input_dir / "raw_finetune.csv"
+    if raw_pre.exists():
+        paths.add(raw_pre)
+    if raw_fine.exists():
+        paths.add(raw_fine)
+    if not paths:
+        logger.warning("No model-ready CSVs found in %s", input_dir)
+    for csv_file in sorted(paths):
         name = csv_file.stem
-        logger.info(f"Processing {name}...")
-        
+        logger.info("Processing %s...", name)
         try:
-            df, stats = preprocessor.process_file(
-                csv_file.name,
-                drop_invalid=True,
-                deduplicate=True
-            )
+            df, stats = preprocessor.process_file(csv_file.name, drop_invalid=True, deduplicate=True)
             preprocessor.save(df, f"{name}_preprocessed.csv")
             results[name] = stats
         except Exception as e:
-            logger.error(f"Failed to process {name}: {e}")
+            logger.error("Failed to process %s: %s", name, e)
             results[name] = {"error": str(e)}
-    
     return results
+
 
 
 def step_featurize(config: dict, input_dir: Path, output_dir: Path) -> dict:
