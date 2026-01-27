@@ -199,7 +199,7 @@ def step_featurize(config: dict, input_dir: Path, output_dir: Path) -> dict:
     )
     
     results = {}
-    for csv_file in input_dir.glob("*_preprocessed.csv"):
+    for csv_file in input_dir.glob("*.csv"):
         name = csv_file.stem.replace("_preprocessed", "")
         logger.info(f"Featurizing {name}...")
         
