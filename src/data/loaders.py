@@ -1,307 +1,379 @@
 """
-Data loaders for TDC ADME datasets and ChEMBL Aurora kinase data.
+Data loaders for SEAL-ADME.
+
+This module provides functions to load ADME datasets from:
+- Therapeutics Data Commons (TDC)
+- ChEMBL (Aurora kinase bioactivity data)
+- Generated molecules
 """
 
+import json
 import logging
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 
-from .constants import PRETRAIN_TASKS, FINETUNE_TASKS, AURORA_SEARCH_TERMS, STANDARD_COLUMNS
+from .constants import (
+    PRETRAIN_TASKS,
+    FINETUNE_TASKS,
+    MIN_CLASSIFICATION_THRESHOLD,
+    AURORA_TARGET_SYNONYMS,
+    AURORA_ACTIVITY_TYPES,
+    SMILES_ENCODINGS,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def infer_task_type(series: pd.Series) -> str:
+# =============================================================================
+# Task type inference
+# =============================================================================
+
+def infer_task_type(series: pd.Series, threshold: int = MIN_CLASSIFICATION_THRESHOLD) -> str:
     """
     Infer whether a task is classification or regression based on label distribution.
     
     Args:
-        series: Pandas series of labels
+        series: Pandas Series of target values
+        threshold: Maximum unique values to be considered classification
         
     Returns:
-        'classification' or 'regression'
+        "classification" or "regression"
     """
     s = series.dropna()
     if s.empty:
         return "classification"
     
+    # Try to convert to numeric
     s_num = pd.to_numeric(s, errors="coerce")
     num_numeric = s_num.notna().sum()
     
+    # If less than 80% are numeric, treat as classification
     if num_numeric < max(1, int(0.8 * len(s))):
         return "classification"
     
     nunique = int(s_num.nunique())
-    return "classification" if nunique <= 10 else "regression"
+    return "classification" if nunique <= threshold else "regression"
 
 
-class TDCLoader:
-    """Load ADME datasets from Therapeutics Data Commons (TDC)."""
-    
-    def __init__(self, output_dir: Path):
-        """
-        Initialize TDC loader.
-        
-        Args:
-            output_dir: Directory to save raw data files
-        """
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-    
-    def load_tasks(
-        self,
-        tasks: List[str],
-        source_tag: str
-    ) -> pd.DataFrame:
-        """
-        Load multiple TDC tasks and combine into single DataFrame.
-        
-        Args:
-            tasks: List of TDC task names
-            source_tag: Tag to identify data source ('pretrain' or 'finetune')
-            
-        Returns:
-            Combined DataFrame with standardized columns
-        """
-        try:
-            from tdc.single_pred import ADME
-        except ImportError:
-            raise ImportError("pytdc is required. Install with: pip install pytdc")
-        
-        dfs = []
-        for task in tasks:
-            logger.info(f"Loading TDC task: {task}")
-            try:
-                adme = ADME(name=task)
-                df = adme.get_data()
-                df = df.rename(columns={"Drug": "original_smiles"})
-                df["task_name"] = task
-                df["source"] = source_tag
-                df["task"] = infer_task_type(df["Y"])
-                df = df[STANDARD_COLUMNS]
-                dfs.append(df)
-            except Exception as e:
-                logger.warning(f"Failed to load task {task}: {e}")
-                continue
-        
-        if dfs:
-            return pd.concat(dfs, ignore_index=True)
-        return pd.DataFrame(columns=STANDARD_COLUMNS)
-    
-    def load_pretrain(self) -> pd.DataFrame:
-        """Load all pretraining tasks."""
-        return self.load_tasks(PRETRAIN_TASKS, "pretrain")
-    
-    def load_finetune(self) -> pd.DataFrame:
-        """Load all finetuning tasks."""
-        return self.load_tasks(FINETUNE_TASKS, "finetune")
-    
-    def save(self, df: pd.DataFrame, filename: str) -> Path:
-        """Save DataFrame to CSV."""
-        path = self.output_dir / filename
-        df.to_csv(path, index=False)
-        logger.info(f"Saved {len(df)} rows to {path}")
-        return path
+# =============================================================================
+# TDC data loading
+# =============================================================================
 
-
-class ChEMBLAuroraLoader:
-    """Load Aurora kinase activity data from ChEMBL."""
-    
-    def __init__(self, output_dir: Path):
-        """
-        Initialize ChEMBL loader.
-        
-        Args:
-            output_dir: Directory to save raw data files
-        """
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self._assay_cache: Dict[str, Dict] = {}
-    
-    def _get_client(self):
-        """Get ChEMBL web resource client."""
-        try:
-            from chembl_webresource_client.new_client import new_client
-            return new_client
-        except ImportError:
-            raise ImportError(
-                "chembl_webresource_client is required. "
-                "Install with: pip install chembl-webresource-client"
-            )
-    
-    def find_aurora_targets(self) -> List[str]:
-        """
-        Find ChEMBL target IDs for Aurora kinases.
-        
-        Returns:
-            List of target ChEMBL IDs
-        """
-        client = self._get_client()
-        target_client = client.target
-        
-        # Search by preferred name
-        pref = list(target_client.filter(pref_name__icontains="Aurora"))
-        
-        # Search by synonyms
-        syn = []
-        for term in AURORA_SEARCH_TERMS:
-            try:
-                syn.extend(list(target_client.filter(target_synonym__icontains=term)))
-            except Exception:
-                continue
-        
-        ids = {t.get("target_chembl_id") for t in (pref + syn) if t.get("target_chembl_id")}
-        logger.info(f"Found {len(ids)} Aurora kinase targets")
-        return list(ids)
-    
-    def _fetch_assay_metadata(self, assay_id: Optional[str]) -> Dict[str, Any]:
-        """Fetch and cache assay metadata."""
-        empty_meta = {
-            "assay_chembl_id": None,
-            "assay_description": "",
-            "assay_type": "",
-            "assay_organism": "",
-            "assay_parameters": ""
-        }
-        
-        if not assay_id:
-            return empty_meta
-        
-        if assay_id in self._assay_cache:
-            return self._assay_cache[assay_id]
-        
-        client = self._get_client()
-        try:
-            a = client.assay.get(assay_id)
-            meta = {
-                "assay_chembl_id": assay_id,
-                "assay_description": a.get("description") or a.get("assay_description") or "",
-                "assay_type": a.get("assay_type") or "",
-                "assay_organism": a.get("assay_organism") or "",
-                "assay_parameters": a.get("assay_parameters") or a.get("assay_param") or ""
-            }
-        except Exception:
-            meta = {**empty_meta, "assay_chembl_id": assay_id}
-        
-        self._assay_cache[assay_id] = meta
-        return meta
-    
-    def fetch_activities(
-        self,
-        target_ids: List[str],
-        standard_types: List[str] = None
-    ) -> pd.DataFrame:
-        """
-        Fetch activity data for specified targets.
-        
-        Args:
-            target_ids: List of ChEMBL target IDs
-            standard_types: Activity types to include (default: IC50, Ki)
-            
-        Returns:
-            DataFrame with activity data
-        """
-        if standard_types is None:
-            standard_types = ["IC50", "Ki"]
-        
-        client = self._get_client()
-        activity_client = client.activity
-        
-        if not target_ids:
-            logger.warning("No target IDs provided")
-            return pd.DataFrame()
-        
-        query = activity_client.filter(
-            target_chembl_id__in=target_ids
-        ).filter(
-            standard_type__in=standard_types
-        )
-        
-        rows = []
-        for rec in query:
-            smi = rec.get("canonical_smiles") or rec.get("smiles")
-            sval = rec.get("standard_value")
-            sval_num = pd.to_numeric(sval, errors="coerce")
-            
-            if not smi or pd.isna(sval_num):
-                continue
-            
-            assay_id = rec.get("assay_chembl_id")
-            assay_meta = self._fetch_assay_metadata(assay_id)
-            
-            rows.append({
-                "molecule_chembl_id": rec.get("molecule_chembl_id"),
-                "canonical_smiles": smi,
-                "standard_value": float(sval_num),
-                "standard_units": rec.get("standard_units") or "",
-                "standard_relation": rec.get("standard_relation") or "",
-                "target_chembl_id": rec.get("target_chembl_id"),
-                "standard_type": rec.get("standard_type"),
-                "pchembl_value": rec.get("pchembl_value"),
-                **assay_meta
-            })
-        
-        df = pd.DataFrame(rows)
-        logger.info(f"Fetched {len(df)} activity records")
-        return df
-    
-    def save(self, df: pd.DataFrame, filename: str) -> Path:
-        """Save DataFrame to CSV."""
-        path = self.output_dir / filename
-        df.to_csv(path, index=False)
-        logger.info(f"Saved {len(df)} rows to {path}")
-        return path
-
-
-def filter_aurora_data(
-    df: pd.DataFrame,
-    min_target_count: int = 200,
-    organism: str = "Homo sapiens",
-    assay_type: str = "B",
-    require_pchembl: bool = True
-) -> pd.DataFrame:
+def load_tdc_task(task_name: str, source_tag: str = "tdc") -> pd.DataFrame:
     """
-    Apply standard filters to Aurora kinase data.
+    Load a single ADME task from TDC.
     
     Args:
-        df: Raw Aurora kinase DataFrame
-        min_target_count: Minimum occurrences per target to keep
-        organism: Filter to specific organism
-        assay_type: Filter to assay type (B=binding)
-        require_pchembl: Whether to require pChEMBL values
+        task_name: Name of the TDC ADME task
+        source_tag: Tag to identify data source (e.g., "pretrain", "finetune")
         
     Returns:
-        Filtered DataFrame
+        DataFrame with standardized columns
     """
-    logger.info(f"Starting with {len(df)} rows")
+    try:
+        from tdc.single_pred import ADME
+    except ImportError:
+        raise ImportError("TDC not installed. Run: pip install PyTDC")
     
-    # Keep only exact measurements
-    if "standard_relation" in df.columns:
-        df = df[df["standard_relation"] == "="].copy()
-        logger.info(f"After relation filter: {len(df)} rows")
+    adme = ADME(name=task_name)
+    df = adme.get_data()
     
-    # Keep targets with sufficient data
-    if "target_chembl_id" in df.columns:
-        counts = df["target_chembl_id"].value_counts(dropna=True)
-        keep_ids = counts[counts > min_target_count].index.tolist()
-        df = df[df["target_chembl_id"].isin(keep_ids)].copy()
-        logger.info(f"After target count filter (>{min_target_count}): {len(df)} rows")
+    # Standardize column names
+    df = df.rename(columns={"Drug": "original_smiles"})
+    df["task_name"] = task_name
+    df["source"] = source_tag
+    df["task"] = infer_task_type(df["Y"])
     
-    # Filter by organism
-    if "assay_organism" in df.columns and organism:
-        df = df[df["assay_organism"] == organism].copy()
-        logger.info(f"After organism filter ({organism}): {len(df)} rows")
+    # Select and order columns
+    columns = ["Drug_ID", "original_smiles", "Y", "task_name", "source", "task"]
+    df = df[columns]
     
-    # Filter by assay type
-    if "assay_type" in df.columns and assay_type:
-        df = df[df["assay_type"] == assay_type].copy()
-        logger.info(f"After assay type filter ({assay_type}): {len(df)} rows")
-    
-    # Require pChEMBL values
-    if require_pchembl and "pchembl_value" in df.columns:
-        df = df[~df["pchembl_value"].isna()].copy()
-        logger.info(f"After pChEMBL filter: {len(df)} rows")
-    
+    logger.info(f"Loaded {task_name}: {len(df)} samples ({df['task'].iloc[0]})")
     return df
+
+
+def load_tdc_tasks(
+    tasks: List[str],
+    source_tag: str = "tdc"
+) -> pd.DataFrame:
+    """
+    Load multiple ADME tasks from TDC.
+    
+    Args:
+        tasks: List of TDC task names
+        source_tag: Tag to identify data source
+        
+    Returns:
+        Combined DataFrame with all tasks
+    """
+    dfs = []
+    for task in tasks:
+        try:
+            df = load_tdc_task(task, source_tag)
+            dfs.append(df)
+        except Exception as e:
+            logger.warning(f"Failed to load {task}: {e}")
+            continue
+    
+    if not dfs:
+        return pd.DataFrame(columns=[
+            "Drug_ID", "original_smiles", "Y", "task_name", "source", "task"
+        ])
+    
+    return pd.concat(dfs, ignore_index=True)
+
+
+def load_pretrain_data() -> pd.DataFrame:
+    """Load all pretraining tasks from TDC."""
+    return load_tdc_tasks(PRETRAIN_TASKS, source_tag="pretrain")
+
+
+def load_finetune_data() -> pd.DataFrame:
+    """Load all finetuning tasks from TDC."""
+    return load_tdc_tasks(FINETUNE_TASKS, source_tag="finetune")
+
+
+# =============================================================================
+# ChEMBL data loading (Aurora kinase)
+# =============================================================================
+
+def find_aurora_target_ids() -> List[str]:
+    """
+    Find ChEMBL target IDs for Aurora kinases.
+    
+    Returns:
+        List of ChEMBL target IDs
+    """
+    try:
+        from chembl_webresource_client.new_client import new_client
+    except ImportError:
+        raise ImportError(
+            "ChEMBL client not installed. Run: pip install chembl-webresource-client"
+        )
+    
+    target_client = new_client.target
+    
+    # Search by preferred name
+    targets = list(target_client.filter(pref_name__icontains="Aurora"))
+    
+    # Search by synonyms
+    for synonym in AURORA_TARGET_SYNONYMS:
+        try:
+            targets.extend(list(target_client.filter(target_synonym__icontains=synonym)))
+        except Exception:
+            continue
+    
+    # Extract unique target IDs
+    target_ids = {t.get("target_chembl_id") for t in targets if t.get("target_chembl_id")}
+    return list(target_ids)
+
+
+def fetch_aurora_activities(target_ids: Optional[List[str]] = None) -> pd.DataFrame:
+    """
+    Fetch Aurora kinase bioactivity data from ChEMBL.
+    
+    Args:
+        target_ids: Optional list of target IDs. If None, will be auto-discovered.
+        
+    Returns:
+        DataFrame with activity data
+    """
+    try:
+        from chembl_webresource_client.new_client import new_client
+    except ImportError:
+        raise ImportError(
+            "ChEMBL client not installed. Run: pip install chembl-webresource-client"
+        )
+    
+    if target_ids is None:
+        target_ids = find_aurora_target_ids()
+    
+    if not target_ids:
+        logger.warning("No Aurora kinase targets found")
+        return pd.DataFrame()
+    
+    logger.info(f"Fetching activities for {len(target_ids)} Aurora kinase targets")
+    
+    activity_client = new_client.activity
+    assay_client = new_client.assay
+    
+    # Cache for assay metadata
+    assay_cache: Dict[str, Dict] = {}
+    
+    rows = []
+    query = activity_client.filter(
+        target_chembl_id__in=target_ids
+    ).filter(
+        standard_type__in=AURORA_ACTIVITY_TYPES
+    )
+    
+    for rec in query:
+        smiles = rec.get("canonical_smiles") or rec.get("smiles")
+        sval = rec.get("standard_value")
+        sval_num = pd.to_numeric(sval, errors="coerce")
+        
+        if not smiles or pd.isna(sval_num):
+            continue
+        
+        # Fetch assay metadata
+        assay_id = rec.get("assay_chembl_id")
+        if assay_id and assay_id not in assay_cache:
+            try:
+                assay = assay_client.get(assay_id)
+                assay_cache[assay_id] = {
+                    "assay_chembl_id": assay_id,
+                    "assay_description": assay.get("description", ""),
+                    "assay_type": assay.get("assay_type", ""),
+                    "assay_organism": assay.get("assay_organism", ""),
+                }
+            except Exception:
+                assay_cache[assay_id] = {"assay_chembl_id": assay_id}
+        
+        assay_meta = assay_cache.get(assay_id, {})
+        
+        rows.append({
+            "molecule_chembl_id": rec.get("molecule_chembl_id"),
+            "original_smiles": smiles,
+            "standard_value": float(sval_num),
+            "standard_units": rec.get("standard_units"),
+            "standard_relation": rec.get("standard_relation"),
+            "target_chembl_id": rec.get("target_chembl_id"),
+            "standard_type": rec.get("standard_type"),
+            "pchembl_value": rec.get("pchembl_value"),
+            **assay_meta,
+        })
+    
+    df = pd.DataFrame(rows)
+    logger.info(f"Fetched {len(df)} Aurora kinase activity records")
+    return df
+
+
+def load_aurora_data(
+    output_path: Optional[Path] = None,
+    force_fetch: bool = False
+) -> pd.DataFrame:
+    """
+    Load Aurora kinase data, fetching from ChEMBL if necessary.
+    
+    Args:
+        output_path: Optional path to cache the data
+        force_fetch: If True, always fetch fresh data from ChEMBL
+        
+    Returns:
+        Standardized DataFrame with Aurora kinase data
+    """
+    # Check for cached data
+    if output_path and output_path.exists() and not force_fetch:
+        logger.info(f"Loading cached Aurora data from {output_path}")
+        df = pd.read_csv(output_path)
+    else:
+        df = fetch_aurora_activities()
+        if output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(output_path, index=False)
+            logger.info(f"Saved Aurora data to {output_path}")
+    
+    if df.empty:
+        return df
+    
+    # Standardize to match TDC format
+    df_std = df.copy()
+    df_std["Drug_ID"] = df_std["molecule_chembl_id"]
+    df_std["Y"] = df_std["pchembl_value"]  # Use pChEMBL value as target
+    df_std["task_name"] = "aurora_potency"
+    df_std["source"] = "chembl"
+    df_std["task"] = "regression"
+    
+    return df_std
+
+
+# =============================================================================
+# Generated molecules loading
+# =============================================================================
+
+def load_generated_molecules(
+    path_or_url: Union[str, Path],
+    smiles_col: str = "SMILES",
+) -> pd.DataFrame:
+    """
+    Load generated molecules from a CSV file or URL.
+    
+    Args:
+        path_or_url: Path to CSV file or URL
+        smiles_col: Name of the SMILES column
+        
+    Returns:
+        Standardized DataFrame
+    """
+    df = pd.read_csv(str(path_or_url))
+    
+    # Standardize column names
+    if smiles_col in df.columns and smiles_col != "original_smiles":
+        df = df.rename(columns={smiles_col: "original_smiles"})
+    
+    # Remove Name column if present
+    if "Name" in df.columns:
+        df = df.drop(columns=["Name"])
+    
+    # Add required columns
+    df["Y"] = 0  # Placeholder for unlabeled data
+    df["task"] = "generated"
+    df["task_name"] = "generated"
+    df["source"] = "generated"
+    
+    # Generate Drug_IDs if not present
+    if "Drug_ID" not in df.columns:
+        df.insert(0, "Drug_ID", [f"GEN_{i+1}" for i in range(len(df))])
+    
+    # Select columns
+    columns = ["Drug_ID", "original_smiles", "Y", "task_name", "source", "task"]
+    df = df[[c for c in columns if c in df.columns]]
+    
+    logger.info(f"Loaded {len(df)} generated molecules")
+    return df
+
+
+# =============================================================================
+# Utility functions
+# =============================================================================
+
+def read_csv_safe(path: Path) -> pd.DataFrame:
+    """
+    Read CSV file with multiple encoding fallbacks.
+    
+    Args:
+        path: Path to CSV file
+        
+    Returns:
+        DataFrame
+    """
+    for encoding in SMILES_ENCODINGS:
+        try:
+            return pd.read_csv(path, encoding=encoding)
+        except Exception:
+            continue
+    
+    # Final fallback with Python engine
+    return pd.read_csv(path, engine="python")
+
+
+def save_manifest(
+    manifest: Dict,
+    output_path: Path,
+    step_name: str = "data_loading"
+) -> None:
+    """
+    Save a manifest file documenting the data loading step.
+    
+    Args:
+        manifest: Dictionary with manifest data
+        output_path: Path to save manifest
+        step_name: Name of the processing step
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest["step"] = step_name
+    with open(output_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    logger.info(f"Saved manifest to {output_path}")
