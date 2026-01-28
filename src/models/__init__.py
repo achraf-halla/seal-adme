@@ -1,39 +1,70 @@
 """
-SEAL model implementations for fragment-aware molecular property prediction.
+SEAL-ADME Models Module.
+
+This module provides fragment-aware graph neural network architectures
+for molecular property prediction with built-in interpretability.
+
+Layers:
+    SEALConv: Fragment-aware GCN convolution
+    SEALGINConv: Fragment-aware GIN convolution
+
+Encoders:
+    GCNEncoder: GCN-based fragment encoder
+    GINEncoder: GIN-based fragment encoder
+    FragmentAwareEncoder: Alias for GCNEncoder
+    SEALGINEncoder: Alias for GINEncoder
+
+Models:
+    MultiTaskModel: Multi-task prediction model
+    PretrainModel: Model for classification pretraining
+    FinetuneModel: Model for regression finetuning
+
+Factory Functions:
+    create_encoder: Create encoder by type
+    create_model: Create complete model
+    load_pretrained_encoder: Load encoder from checkpoint
 """
 
-from .layers import SEALConv, SEALGINConv, GINConv
-from .encoder import FragmentAwareEncoder, GINEncoder, load_encoder
-from .seal import (
+from .layers import (
+    SEALConv,
+    SEALGINConv,
+)
+
+from .encoders import (
+    BaseEncoder,
+    GCNEncoder,
+    GINEncoder,
+    FragmentAwareEncoder,
+    SEALGINEncoder,
+    create_encoder,
+)
+
+from .heads import (
     TaskHead,
-    MLPHead,
     MultiTaskModel,
     PretrainModel,
-    RegressionModel,
-    build_model,
+    FinetuneModel,
+    create_model,
+    load_pretrained_encoder,
 )
-from .random_forest import (
-    RandomForestBaseline,
-    train_rf_baseline,
-)
+
 
 __all__ = [
     # Layers
     "SEALConv",
     "SEALGINConv",
-    "GINConv",
     # Encoders
-    "FragmentAwareEncoder",
+    "BaseEncoder",
+    "GCNEncoder",
     "GINEncoder",
-    "load_encoder",
+    "FragmentAwareEncoder",
+    "SEALGINEncoder",
+    "create_encoder",
     # Models
     "TaskHead",
-    "MLPHead",
     "MultiTaskModel",
     "PretrainModel",
-    "RegressionModel",
-    "build_model",
-    # Baselines
-    "RandomForestBaseline",
-    "train_rf_baseline",
+    "FinetuneModel",
+    "create_model",
+    "load_pretrained_encoder",
 ]
