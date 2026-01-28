@@ -212,6 +212,5 @@ This enables:
 ## References
 
 - Musial et al. (2025). SEAL: Substructure-Explainable Active Learning for Molecular Property Prediction.
-- Liu et al. (2022). GraphBP: Generating 3D Molecules by 3D Molecular Generative Models.
 
 
