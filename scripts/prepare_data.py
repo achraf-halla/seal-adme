@@ -507,6 +507,109 @@ def step_split(
     return results
 
 
+def step_combine_pretrain(
+    config: Dict,
+    splits_dir: Path,
+    graphs_dir: Path,
+    output_dir: Path,
+) -> Dict[str, Any]:
+    """
+    Step 5: Combine classification tasks into pretrain format.
+    
+    Creates combined metadata parquets and symlinks/copies graphs
+    for multi-task pretraining.
+    """
+    import shutil
+    
+    logger = get_logger("combine_pretrain")
+    logger.info("Combining classification tasks for pretraining...")
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pretrain_graphs_dir = output_dir / "graphs"
+    pretrain_graphs_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Get pretrain tasks from config
+    tdc_config = config.get("tdc", {})
+    pretrain_tasks = tdc_config.get("pretrain_tasks", PRETRAIN_TASKS)
+    
+    # Classification tasks only
+    classification_tasks = [t for t in pretrain_tasks if t in CLASSIFICATION_TASKS]
+    
+    combined_metadata = {split: [] for split in ['train', 'valid', 'test']}
+    graph_counter = 0
+    
+    for task_name in classification_tasks:
+        task_split_dir = splits_dir / task_name
+        task_graph_dir = graphs_dir / task_name
+        
+        if not task_split_dir.exists():
+            logger.warning(f"Skipping {task_name} - splits not found")
+            continue
+        
+        for split in ['train', 'valid', 'test']:
+            parquet_file = task_split_dir / f"{task_name}_{split}.parquet"
+            graph_split_dir = task_graph_dir / split
+            
+            if not parquet_file.exists():
+                continue
+            
+            df = pd.read_parquet(parquet_file)
+            
+            # Process each row
+            for idx, row in df.iterrows():
+                # Find corresponding graph file
+                old_graph_pattern = f"{task_name}_{split}_{idx:06d}.pt"
+                old_graph_path = graph_split_dir / old_graph_pattern
+                
+                if not old_graph_path.exists():
+                    # Try alternate naming
+                    graph_files = list(graph_split_dir.glob(f"*_{idx:06d}.pt"))
+                    if graph_files:
+                        old_graph_path = graph_files[0]
+                    else:
+                        continue
+                
+                # Create new graph ID
+                new_graph_id = f"pretrain_{graph_counter:08d}"
+                new_graph_path = pretrain_graphs_dir / f"{new_graph_id}.pt"
+                
+                # Copy graph file
+                shutil.copy2(old_graph_path, new_graph_path)
+                
+                # Add to metadata
+                meta_row = {
+                    'graph_id': new_graph_id,
+                    'task_name': task_name,
+                    'label': float(row.get('Y', row.get('y', 0))),
+                    'split': split,
+                    'original_drug_id': row.get('Drug_ID', ''),
+                    'smiles': row.get('canonical_smiles', ''),
+                }
+                combined_metadata[split].append(meta_row)
+                graph_counter += 1
+        
+        logger.info(f"  Processed {task_name}")
+    
+    # Save combined metadata
+    results = {}
+    for split in ['train', 'valid', 'test']:
+        if combined_metadata[split]:
+            meta_df = pd.DataFrame(combined_metadata[split])
+            meta_path = output_dir / f"pretrain_{split}.parquet"
+            meta_df.to_parquet(meta_path, index=False)
+            results[split] = {
+                'rows': len(meta_df),
+                'tasks': meta_df['task_name'].nunique(),
+                'path': str(meta_path),
+            }
+            logger.info(f"  Saved {split}: {len(meta_df)} samples")
+    
+    results['total_graphs'] = graph_counter
+    results['graphs_dir'] = str(pretrain_graphs_dir)
+    
+    return results
+
+
 def step_create_graphs(
     config: Dict,
     input_dir: Path,
@@ -705,7 +808,7 @@ Examples:
     graphs_dir = data_dir / "graphs"
     
     # Determine steps to run
-    all_steps = ["load_tdc", "load_aurora", "validate", "split", "graphs"]
+    all_steps = ["load_tdc", "load_aurora", "validate", "split", "graphs", "combine_pretrain"]
     if args.steps.lower() == "all":
         steps = all_steps
     else:
@@ -768,6 +871,16 @@ Examples:
             logger.info("=" * 70)
             manifest["results"]["graphs"] = step_create_graphs(
                 config, splits_dir, graphs_dir
+            )
+        
+        if "combine_pretrain" in steps:
+            logger.info("")
+            logger.info("=" * 70)
+            logger.info("STEP: Combining tasks for pretraining")
+            logger.info("=" * 70)
+            pretrain_dir = data_dir / "pretrain"
+            manifest["results"]["combine_pretrain"] = step_combine_pretrain(
+                config, splits_dir, graphs_dir, pretrain_dir
             )
         
         manifest["status"] = "completed"

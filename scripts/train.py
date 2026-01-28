@@ -160,8 +160,9 @@ def run_pretraining(args, config: dict) -> dict:
     train_meta = pd.read_parquet(args.train_meta)
     valid_meta = pd.read_parquet(args.valid_meta)
     
-    train_dataset = MultiTaskDataset(graph_dir, train_meta)
-    valid_dataset = MultiTaskDataset(graph_dir, valid_meta)
+    # Pass split parameter since the parquet files are per-split
+    train_dataset = MultiTaskDataset(graph_dir, train_meta, split='train')
+    valid_dataset = MultiTaskDataset(graph_dir, valid_meta, split='valid')
     
     logger.info(f"Train tasks: {train_dataset.task_names}")
     logger.info(f"Valid tasks: {valid_dataset.task_names}")
