@@ -86,10 +86,22 @@ seal-adme/
 
 ```bash
 # Run complete data pipeline
-python scripts/prepare_data.py --config configs/data_config.yaml
+python scripts/prepare_data.py --config configs/data_config.yaml --data-dir data/
 
-# Or run specific steps
-python scripts/prepare_data.py --steps load_tdc,validate,featurize,graphs
+# Run specific steps only
+python scripts/prepare_data.py --steps load_tdc,validate,split,graphs --data-dir data/
+
+# Load TDC + Aurora data, then validate
+python scripts/prepare_data.py --steps load_tdc,load_aurora,validate --data-dir data/
+
+# Just create graphs from already-preprocessed data
+python scripts/prepare_data.py --steps graphs --data-dir data/
+
+# With logging to file
+python scripts/prepare_data.py --config configs/data_config.yaml \
+    --data-dir data/ \
+    --log-file logs/data_pipeline.log \
+    --log-level DEBUG
 ```
 
 ### 2. Model Training
@@ -98,26 +110,48 @@ python scripts/prepare_data.py --steps load_tdc,validate,featurize,graphs
 # Pretraining on classification tasks
 python scripts/train.py \
     --mode pretrain \
+    --config configs/model_config.yaml \
     --graph-dir data/graphs/pretrain \
-    --train-meta data/pretrain_train.parquet \
-    --valid-meta data/pretrain_valid.parquet \
+    --train-meta data/splits/pretrain_train.parquet \
+    --valid-meta data/splits/pretrain_valid.parquet \
     --output-dir results/
 
-# Fine-tuning on regression tasks
+# Finetuning with pretrained encoder
 python scripts/train.py \
     --mode finetune \
+    --config configs/model_config.yaml \
     --graph-dir data/graphs \
     --encoder-path results/pretrain/checkpoints/pretrained_encoder.pt \
     --output-dir results/ \
     --extract-explanations \
     --visualize
 
-# Train from scratch (no pretraining)
+# Finetuning with frozen encoder (only train task heads)
 python scripts/train.py \
     --mode finetune \
     --graph-dir data/graphs \
+    --encoder-path results/pretrain/checkpoints/pretrained_encoder.pt \
+    --freeze-encoder \
+    --output-dir results/
+
+# Train from scratch (no pretraining)
+python scripts/train.py \
+    --mode finetune \
+    --config configs/model_config.yaml \
+    --graph-dir data/graphs \
     --from-scratch \
     --output-dir results/
+
+# Run both phases sequentially (pretrain → finetune)
+python scripts/train.py \
+    --mode both \
+    --config configs/model_config.yaml \
+    --graph-dir data/graphs \
+    --train-meta data/splits/pretrain_train.parquet \
+    --valid-meta data/splits/pretrain_valid.parquet \
+    --output-dir results/ \
+    --extract-explanations \
+    --visualize
 ```
 
 ### 3. Using the Python API
