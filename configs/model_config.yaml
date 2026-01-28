@@ -1,12 +1,18 @@
-# Model and training configuration for SEAL-ADME
+# =============================================================================
+# SEAL-ADME Model Configuration
+# =============================================================================
+# Configuration for model architecture and training hyperparameters.
+# Used by: scripts/train.py
 
-# Model architecture
+# -----------------------------------------------------------------------------
+# Model Architecture
+# -----------------------------------------------------------------------------
 model:
   # Input feature dimension (from atom featurizer)
-  input_features: 25
+  input_dim: 25
   
   # Hidden layer dimension
-  hidden_features: 256
+  hidden_dim: 256
   
   # Number of message passing layers
   num_layers: 4
@@ -14,87 +20,136 @@ model:
   # Dropout rate
   dropout: 0.1
   
-  # Convolution type: 'seal' (GCN-based) or 'gin' (GIN-based)
-  conv_type: seal
+  # Encoder type: 'gcn' (SEALConv) or 'gin' (SEALGINConv)
+  encoder_type: gcn
   
-  # Regularization
-  regularize_encoder: 1.0e-4      # L1 on inter-fragment weights
-  regularize_contribution: 0.5    # L1 on fragment contributions
+  # GIN-specific: whether epsilon is trainable
+  train_eps: false
+  
+  # Regularization weights
+  reg_encoder: 1.0e-4        # L1 on inter-fragment weights
+  reg_contribution: 0.5      # L1 on fragment contributions
 
-# Pretraining configuration (classification tasks)
+# -----------------------------------------------------------------------------
+# Pretraining Configuration (Classification Tasks)
+# -----------------------------------------------------------------------------
 pretrain:
+  # Maximum epochs
   epochs: 50
+  
+  # Batch size
   batch_size: 64
+  
+  # Learning rate
   lr: 1.0e-3
+  
+  # L2 regularization
   weight_decay: 1.0e-5
   
-  # Samples per task per epoch (null = use minimum)
-  samples_per_task: 500
+  # Samples per task per epoch (null = use minimum task size)
+  samples_per_task: null
   
-  # Gradient clipping
+  # Gradient clipping threshold
   grad_clip: 1.0
   
-  # Learning rate scheduler
+  # Learning rate scheduler patience
   lr_patience: 5
-  lr_factor: 0.5
   
-  # Early stopping
+  # Early stopping patience
   early_stop_patience: 15
 
-# Fine-tuning configuration (regression tasks)
+# -----------------------------------------------------------------------------
+# Finetuning Configuration (Regression Tasks)
+# -----------------------------------------------------------------------------
 finetune:
+  # Maximum epochs
   epochs: 120
+  
+  # Batch size
   batch_size: 64
+  
+  # Learning rate (lower than pretraining)
   lr: 3.0e-4
+  
+  # L2 regularization
   weight_decay: 1.0e-6
   
-  # Loss weighting
+  # MSE loss weight
   mse_weight: 1.0
   
-  # Gradient clipping
+  # Gradient clipping threshold
   grad_clip: 1.0
   
-  # Learning rate scheduler
+  # Learning rate scheduler patience
   lr_patience: 8
-  lr_factor: 0.5
   
-  # Early stopping
+  # Early stopping patience
   early_stop_patience: 25
   
   # Task sampling strategy: 'round_robin' or 'proportional'
   task_sampling: round_robin
 
-# Task definitions
+# -----------------------------------------------------------------------------
+# Task Definitions
+# -----------------------------------------------------------------------------
 tasks:
+  # Classification tasks for pretraining
   pretrain:
-    # Classification tasks for pretraining
+    # Absorption
     - hia_hou
     - pgp_broccatelli
     - bioavailability_ma
-    - lipophilicity_astrazeneca
+    # Distribution
     - bbb_martins
     - ppbr_az
     - vdss_lombardo
+    # Metabolism (CYP enzymes)
     - cyp2d6_veith
     - cyp3a4_veith
     - cyp2c9_veith
     - cyp2d6_substrate_carbonmangels
     - cyp3a4_substrate_carbonmangels
     - cyp2c9_substrate_carbonmangels
+    # Excretion
     - clearance_microsome_az
     - clearance_hepatocyte_az
+    # Physicochemical
+    - lipophilicity_astrazeneca
   
+  # Regression tasks for finetuning
+  # Format: [task_name, folder_name] or just task_name (folder = task_name)
   finetune:
-    # Regression tasks for fine-tuning
     - solubility_aqsoldb
     - caco2
     - half_life_obach
-    - AKA  # Aurora Kinase A
-    - AKB  # Aurora Kinase B
+    - AKA   # Aurora Kinase A
+    - AKB   # Aurora Kinase B
 
-# Inference settings
+# -----------------------------------------------------------------------------
+# Inference Settings
+# -----------------------------------------------------------------------------
 inference:
+  # Batch size for inference
   batch_size: 128
+  
+  # Extract explanations after training
   extract_explanations: true
+  
+  # Generate visualizations
   visualize: true
+  
+  # Number of molecules to visualize per task
   visualization_samples: 10
+
+# -----------------------------------------------------------------------------
+# Paths (can be overridden by command line)
+# -----------------------------------------------------------------------------
+paths:
+  # Graph data directory
+  graph_dir: data/graphs
+  
+  # Output directory
+  output_dir: results
+  
+  # Pretrained encoder (for finetuning)
+  encoder_path: null
