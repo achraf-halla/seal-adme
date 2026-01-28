@@ -69,7 +69,7 @@ splitting:
   # Method: "scaffold" (Murcko scaffold) or "random"
   method: scaffold
   # Split ratios
-  train_ratio: 0.7
+  train_ratio: 0.8
   valid_ratio: 0.1
   # test_ratio is computed as 1 - train_ratio - valid_ratio
   # Random seed for reproducibility
