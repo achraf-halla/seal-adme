@@ -1,218 +1,256 @@
 """
-Fragment-aware molecular encoders for SEAL framework.
+Fragment-aware molecular encoders for SEAL.
 
-These encoders process molecular graphs and produce fragment-level
-embeddings that can be used for interpretable property prediction.
+This module provides encoder architectures that transform molecular graphs
+into fragment-level embeddings using BRICS decomposition information.
 """
-
-from typing import Dict, Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch_geometric.data import Data
 from torch_geometric.utils import to_dense_batch
+from typing import Dict, Optional, Union
 
-from .layers import SEALConv, GINConv
+from .layers import SEALConv, SEALGINConv
 
 
-class FragmentAwareEncoder(nn.Module):
-    """
-    Encoder that produces fragment-level molecular representations.
+class EncoderOutput:
+    """Container for encoder outputs."""
     
-    Uses SEAL-style message passing with separate transformations for
-    intra-fragment and inter-fragment edges, followed by fragment
-    pooling using the BRICS decomposition matrix S.
+    def __init__(
+        self,
+        fragment_embeddings: Tensor,
+        fragment_mask: Tensor,
+        reg_loss: Tensor,
+        node_embeddings: Optional[Tensor] = None
+    ):
+        self.fragment_embeddings = fragment_embeddings
+        self.fragment_mask = fragment_mask
+        self.reg_loss = reg_loss
+        self.node_embeddings = node_embeddings
+    
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+    
+    def get(self, key: str, default=None):
+        return getattr(self, key, default)
+
+
+class BaseEncoder(nn.Module):
+    """
+    Base class for fragment-aware molecular encoders.
+    
+    Subclasses must implement _build_conv_layer() to define the
+    specific convolution type (GCN, GIN, etc.).
     
     Args:
-        input_features: Dimension of input node features
-        hidden_features: Dimension of hidden representations
+        input_dim: Dimension of input node features
+        hidden_dim: Dimension of hidden layers
         num_layers: Number of message passing layers
         dropout: Dropout probability
-        conv_type: Type of convolution ('seal' or 'gin')
     """
     
     def __init__(
         self,
-        input_features: int = 25,
-        hidden_features: int = 256,
+        input_dim: int = 25,
+        hidden_dim: int = 256,
         num_layers: int = 4,
-        dropout: float = 0.1,
-        conv_type: str = 'seal'
+        dropout: float = 0.1
     ):
         super().__init__()
         
-        self.input_features = input_features
-        self.hidden_features = hidden_features
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
         self.num_layers = num_layers
-        self.conv_type = conv_type
         
         self.dropout = nn.Dropout(dropout)
-        
-        # Build convolution layers
         self.conv_layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         
-        # Choose convolution type
-        ConvClass = SEALConv if conv_type == 'seal' else GINConv
+        self.conv_layers.append(self._build_conv_layer(input_dim, hidden_dim))
+        self.norms.append(nn.LayerNorm(hidden_dim))
         
-        # First layer: input_features -> hidden_features
-        self.conv_layers.append(ConvClass(input_features, hidden_features))
-        self.norms.append(nn.LayerNorm(hidden_features))
-        
-        # Remaining layers: hidden_features -> hidden_features
         for _ in range(num_layers - 1):
-            self.conv_layers.append(ConvClass(hidden_features, hidden_features))
-            self.norms.append(nn.LayerNorm(hidden_features))
+            self.conv_layers.append(self._build_conv_layer(hidden_dim, hidden_dim))
+            self.norms.append(nn.LayerNorm(hidden_dim))
         
-        # Normalization for fragment embeddings
-        self.fragment_norm = nn.LayerNorm(hidden_features)
+        self.fragment_norm = nn.LayerNorm(hidden_dim)
     
-    def forward(self, data) -> Dict[str, Any]:
+    def _build_conv_layer(self, in_channels: int, out_channels: int) -> nn.Module:
+        raise NotImplementedError("Subclasses must implement _build_conv_layer")
+    
+    def _compute_reg_loss(self) -> Tensor:
+        """Compute L1 regularization on inter-fragment weights."""
+        reg_loss = torch.tensor(0.0, device=next(self.parameters()).device)
+        for layer in self.conv_layers:
+            reg_loss = reg_loss + torch.norm(layer.inter_weight, p=1)
+            if layer.inter_bias is not None:
+                reg_loss = reg_loss + torch.norm(layer.inter_bias, p=1)
+        return reg_loss
+    
+    def _aggregate_to_fragments(
+        self,
+        x: Tensor,
+        s: Tensor,
+        batch: Tensor
+    ) -> tuple:
         """
-        Encode molecular graph to fragment embeddings.
+        Aggregate node embeddings to fragment-level using assignment matrix.
         
         Args:
-            data: PyG Data/Batch object with:
-                - x: Node features [num_nodes, input_features]
-                - edge_index: Edge connectivity [2, num_edges]
-                - s: Fragment membership matrix [num_nodes, num_fragments]
-                - mask: Edge mask (1 = intra-fragment, 0 = inter-fragment)
-                - batch: Batch assignment for nodes
-                
+            x: Node embeddings [N, hidden_dim]
+            s: Fragment assignment matrix [N, max_fragments]
+            batch: Batch assignment vector [N]
+            
         Returns:
-            Dictionary containing:
-                - fragment_embeddings: [batch_size, max_fragments, hidden_features]
-                - fragment_mask: [batch_size, max_fragments]
-                - node_embeddings: [num_nodes, hidden_features]
-                - reg_loss: L1 regularization loss for inter-fragment weights
+            fragment_embeddings: [B, max_fragments, hidden_dim]
+            fragment_mask: [B, max_fragments]
         """
-        x = data.x
-        edge_index = data.edge_index
-        s = data.s
-        batch = data.batch
-        
-        # Convert edge mask to boolean (True = within fragment)
-        edge_brics_mask = data.mask.bool()
-        
-        # Message passing layers
-        for conv, norm in zip(self.conv_layers, self.norms):
-            x = conv(x, edge_index, edge_brics_mask)
-            x = norm(x)
-            x = F.relu(x)
-            x = self.dropout(x)
-        
-        # Store node embeddings before pooling
-        node_embeddings = x
-        
-        # Convert to dense batch format
         x_dense, node_mask = to_dense_batch(x, batch)
         s_dense, _ = to_dense_batch(s, batch)
         
         batch_size, num_nodes, _ = x_dense.size()
         
-        # Apply node mask
         if node_mask is not None:
-            node_mask_expanded = node_mask.unsqueeze(-1).float()
+            node_mask_expanded = node_mask.view(batch_size, num_nodes, 1).float()
             x_dense = x_dense * node_mask_expanded
+            s_dense = s_dense * node_mask_expanded
         
-        # Fragment pooling: S^T @ X
-        # s_dense: [batch, nodes, fragments]
-        # x_dense: [batch, nodes, hidden]
-        # result: [batch, fragments, hidden]
-        fragment_embeddings = torch.matmul(
-            s_dense.transpose(1, 2),  # [batch, fragments, nodes]
-            x_dense                    # [batch, nodes, hidden]
-        )
-        
-        # Normalize fragment embeddings
+        fragment_embeddings = torch.matmul(s_dense.transpose(1, 2), x_dense)
         fragment_embeddings = self.fragment_norm(fragment_embeddings)
         
-        # Create fragment mask (1 if fragment has any atoms)
         fragment_mask = (s_dense.sum(dim=1) > 0).float()
         
-        # Compute regularization loss on inter-fragment weights
-        reg_loss = self._compute_regularization()
+        return fragment_embeddings, fragment_mask
+    
+    def forward(self, data: Data) -> Dict[str, Tensor]:
+        """
+        Forward pass.
+        
+        Args:
+            data: PyG Data object with attributes:
+                - x: Node features [N, input_dim]
+                - edge_index: Edge connectivity [2, E]
+                - s: Fragment assignment matrix [N, max_fragments]
+                - batch: Batch assignment [N]
+                - mask: Edge mask for intra-fragment edges [E]
+                
+        Returns:
+            Dictionary with:
+                - fragment_embeddings: [B, max_fragments, hidden_dim]
+                - fragment_mask: [B, max_fragments]
+                - reg_loss: Scalar regularization loss
+        """
+        x = data.x
+        edge_index = data.edge_index
+        edge_mask = data.mask.bool()
+        
+        for conv, norm in zip(self.conv_layers, self.norms):
+            x = conv(x, edge_index, edge_mask)
+            x = norm(x)
+            x = F.relu(x)
+            x = self.dropout(x)
+        
+        fragment_embeddings, fragment_mask = self._aggregate_to_fragments(
+            x, data.s, data.batch
+        )
+        
+        reg_loss = self._compute_reg_loss()
         
         return {
             'fragment_embeddings': fragment_embeddings,
             'fragment_mask': fragment_mask,
-            'node_embeddings': node_embeddings,
-            'reg_loss': reg_loss
+            'reg_loss': reg_loss,
+            'node_embeddings': x
         }
-    
-    def _compute_regularization(self) -> Tensor:
-        """Compute L1 regularization on inter-fragment weights."""
-        reg_loss = torch.tensor(0.0, device=next(self.parameters()).device)
-        
-        for layer in self.conv_layers:
-            if hasattr(layer, 'inter_weights'):
-                reg_loss = reg_loss + torch.norm(layer.inter_weights, p=1)
-            if hasattr(layer, 'inter_bias') and layer.inter_bias is not None:
-                reg_loss = reg_loss + torch.norm(layer.inter_bias, p=1)
-        
-        return reg_loss
 
 
-class GINEncoder(FragmentAwareEncoder):
+class GCNEncoder(BaseEncoder):
     """
-    GIN-based fragment-aware encoder.
+    Fragment-aware GCN encoder.
     
-    Uses Graph Isomorphism Network convolutions with separate MLPs
-    for intra-fragment and inter-fragment messages. More expressive
-    than SEAL-GCN but maintains interpretability.
+    Uses SEALConv layers with mean aggregation and linear transformations.
+    
+    Args:
+        input_dim: Dimension of input node features
+        hidden_dim: Dimension of hidden layers
+        num_layers: Number of message passing layers
+        dropout: Dropout probability
+    """
+    
+    def _build_conv_layer(self, in_channels: int, out_channels: int) -> SEALConv:
+        return SEALConv(in_channels, out_channels, aggr="mean")
+
+
+class GINEncoder(BaseEncoder):
+    """
+    Fragment-aware GIN encoder.
+    
+    Uses SEALGINConv layers with sum aggregation and MLPs.
+    
+    Args:
+        input_dim: Dimension of input node features
+        hidden_dim: Dimension of hidden layers
+        num_layers: Number of message passing layers
+        dropout: Dropout probability
+        train_eps: Whether to make epsilon learnable
     """
     
     def __init__(
         self,
-        input_features: int = 25,
-        hidden_features: int = 256,
+        input_dim: int = 25,
+        hidden_dim: int = 256,
         num_layers: int = 4,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        train_eps: bool = False
     ):
-        super().__init__(
-            input_features=input_features,
-            hidden_features=hidden_features,
-            num_layers=num_layers,
-            dropout=dropout,
-            conv_type='gin'
+        self.train_eps = train_eps
+        super().__init__(input_dim, hidden_dim, num_layers, dropout)
+    
+    def _build_conv_layer(self, in_channels: int, out_channels: int) -> SEALGINConv:
+        return SEALGINConv(
+            in_channels,
+            out_channels,
+            aggr="add",
+            train_eps=self.train_eps
         )
 
 
-def load_encoder(
-    checkpoint_path: str,
-    input_features: int = 25,
-    hidden_features: int = 256,
+# Aliases for backward compatibility
+FragmentAwareEncoder = GCNEncoder
+SEALGINEncoder = GINEncoder
+
+
+def create_encoder(
+    encoder_type: str = "gcn",
+    input_dim: int = 25,
+    hidden_dim: int = 256,
     num_layers: int = 4,
     dropout: float = 0.1,
-    conv_type: str = 'seal',
-    device: str = 'cpu'
-) -> FragmentAwareEncoder:
+    **kwargs
+) -> BaseEncoder:
     """
-    Load a pretrained encoder from checkpoint.
+    Factory function to create encoder by type.
     
     Args:
-        checkpoint_path: Path to saved encoder state dict
-        input_features: Input feature dimension
-        hidden_features: Hidden feature dimension
-        num_layers: Number of conv layers
-        dropout: Dropout rate
-        conv_type: Type of convolution ('seal' or 'gin')
-        device: Device to load model on
+        encoder_type: 'gcn' or 'gin'
+        input_dim: Dimension of input node features
+        hidden_dim: Dimension of hidden layers
+        num_layers: Number of message passing layers
+        dropout: Dropout probability
+        **kwargs: Additional arguments for specific encoders
         
     Returns:
-        Loaded encoder model
+        Encoder instance
     """
-    encoder = FragmentAwareEncoder(
-        input_features=input_features,
-        hidden_features=hidden_features,
-        num_layers=num_layers,
-        dropout=dropout,
-        conv_type=conv_type
-    )
+    encoder_type = encoder_type.lower()
     
-    state_dict = torch.load(checkpoint_path, map_location=device)
-    encoder.load_state_dict(state_dict)
-    encoder = encoder.to(device)
-    
-    return encoder
+    if encoder_type == "gcn":
+        return GCNEncoder(input_dim, hidden_dim, num_layers, dropout)
+    elif encoder_type == "gin":
+        train_eps = kwargs.get("train_eps", False)
+        return GINEncoder(input_dim, hidden_dim, num_layers, dropout, train_eps)
+    else:
+        raise ValueError(f"Unknown encoder type: {encoder_type}. Use 'gcn' or 'gin'.")
