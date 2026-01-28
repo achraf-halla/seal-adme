@@ -125,4 +125,3 @@ AURORA_ACTIVITY_TYPES: List[str] = [
 # =============================================================================
 MIN_CLASSIFICATION_THRESHOLD: int = 10  # Max unique values to be considered classification
 SMILES_ENCODINGS: List[str] = ["utf-8", "utf-8-sig", "latin1"]
-
