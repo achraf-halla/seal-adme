@@ -93,68 +93,15 @@ python scripts/prepare_data.py --steps load_tdc,validate,featurize,graphs
 ```
 
 ### 2. Model Training
-
-```bash
-# Pretraining on classification tasks
-python scripts/train.py \
-    --mode pretrain \
-    --graph-dir data/graphs/pretrain \
-    --train-meta data/pretrain_train.parquet \
-    --valid-meta data/pretrain_valid.parquet \
-    --output-dir results/
-
-# Fine-tuning on regression tasks
-python scripts/train.py \
-    --mode finetune \
-    --graph-dir data/graphs \
-    --encoder-path results/pretrain/checkpoints/pretrained_encoder.pt \
-    --output-dir results/ \
-    --extract-explanations \
-    --visualize
-
-# Train from scratch (no pretraining)
-python scripts/train.py \
-    --mode finetune \
-    --graph-dir data/graphs \
-    --from-scratch \
-    --output-dir results/
+```
+In Progress...
 ```
 
 ### 3. Using the Python API
 
-```python
-from src.data import GraphFeaturizer, canonicalize_smiles
-from src.models import build_model, load_encoder
-from src.training import load_task_datasets, RegressionTrainer
-from src.evaluation import extract_explanations, visualize_explanations
-
-# Create graphs from SMILES
-featurizer = GraphFeaturizer(store_fragments=True)
-graphs = featurizer(df, stats={"mean": 0.0, "std": 1.0})
-
-# Build and train model
-model = build_model(
-    task_names=["solubility", "caco2"],
-    hidden_features=256,
-    conv_type="seal",  # or "gin"
-    pretrained_encoder_path="encoder.pt"
-)
-
-# Extract explanations
-explanations = extract_explanations(
-    model=model,
-    task_name="solubility",
-    graphs=test_graphs
-)
-
-# Visualize
-visualize_explanations(
-    explanations,
-    output_dir="visualizations/",
-    sample_size=10
-)
 ```
-
+In Progress...
+```
 ## Model Architecture
 
 ### Fragment-Aware Message Passing
