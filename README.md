@@ -31,7 +31,7 @@ Extension of the original SEAL framework (Musial et al., 2025) with:
 
 ```bash
 # Clone the repository
-git clone https://github.com/achraf-halla/seal-adme.git
+git clone https://github.com/username/seal-adme.git
 cd seal-adme
 
 # Create conda environment (recommended)
@@ -86,22 +86,10 @@ seal-adme/
 
 ```bash
 # Run complete data pipeline
-python scripts/prepare_data.py --config configs/data_config.yaml --data-dir data/
+python scripts/prepare_data.py --config configs/data_config.yaml
 
-# Run specific steps only
-python scripts/prepare_data.py --steps load_tdc,validate,split,graphs --data-dir data/
-
-# Load TDC + Aurora data, then validate
-python scripts/prepare_data.py --steps load_tdc,load_aurora,validate --data-dir data/
-
-# Just create graphs from already-preprocessed data
-python scripts/prepare_data.py --steps graphs --data-dir data/
-
-# With logging to file
-python scripts/prepare_data.py --config configs/data_config.yaml \
-    --data-dir data/ \
-    --log-file logs/data_pipeline.log \
-    --log-level DEBUG
+# Or run specific steps
+python scripts/prepare_data.py --steps load_tdc,validate,featurize,graphs
 ```
 
 ### 2. Model Training
@@ -110,48 +98,26 @@ python scripts/prepare_data.py --config configs/data_config.yaml \
 # Pretraining on classification tasks
 python scripts/train.py \
     --mode pretrain \
-    --config configs/model_config.yaml \
     --graph-dir data/graphs/pretrain \
-    --train-meta data/splits/pretrain_train.parquet \
-    --valid-meta data/splits/pretrain_valid.parquet \
+    --train-meta data/pretrain_train.parquet \
+    --valid-meta data/pretrain_valid.parquet \
     --output-dir results/
 
-# Finetuning with pretrained encoder
+# Fine-tuning on regression tasks
 python scripts/train.py \
     --mode finetune \
-    --config configs/model_config.yaml \
     --graph-dir data/graphs \
     --encoder-path results/pretrain/checkpoints/pretrained_encoder.pt \
     --output-dir results/ \
     --extract-explanations \
     --visualize
-
-# Finetuning with frozen encoder (only train task heads)
-python scripts/train.py \
-    --mode finetune \
-    --graph-dir data/graphs \
-    --encoder-path results/pretrain/checkpoints/pretrained_encoder.pt \
-    --freeze-encoder \
-    --output-dir results/
 
 # Train from scratch (no pretraining)
 python scripts/train.py \
     --mode finetune \
-    --config configs/model_config.yaml \
     --graph-dir data/graphs \
     --from-scratch \
     --output-dir results/
-
-# Run both phases sequentially (pretrain → finetune)
-python scripts/train.py \
-    --mode both \
-    --config configs/model_config.yaml \
-    --graph-dir data/graphs \
-    --train-meta data/splits/pretrain_train.parquet \
-    --valid-meta data/splits/pretrain_valid.parquet \
-    --output-dir results/ \
-    --extract-explanations \
-    --visualize
 ```
 
 ### 3. Using the Python API
@@ -193,12 +159,31 @@ visualize_explanations(
 
 ### Fragment-Aware Message Passing
 
-The key innovation is separate linear transformations for intra-fragment and inter-fragment edges.
+The key innovation is separate linear transformations for intra-fragment and inter-fragment edges:
+
+```
+h_i^{l+1} = σ(W_root · h_i^l + Σ_{j∈N(i)} M(h_j^l, e_ij))
+
+where M(h_j, e_ij) = W_intra · h_j  if edge within fragment
+                   = W_inter · h_j  if edge crosses fragment boundary
+```
+
 This enables:
 1. **Interpretable attributions**: Fragment contributions sum to the prediction
 2. **Regularization**: L1 penalty on inter-fragment weights encourages local explanations
 3. **Transfer learning**: Encoder learns general fragment representations
 
+### Fragment Pooling
+
+After message passing, fragment embeddings are computed via:
+```
+z_f = Σ_{i∈f} h_i  (sum over atoms in fragment f)
+```
+
+Final prediction is the sum of fragment contributions:
+```
+y = Σ_f W_task · z_f
+```
 
 ## Data Sources
 
@@ -207,10 +192,26 @@ This enables:
 - **ChEMBL**: Aurora kinase bioactivity data
   - https://www.ebi.ac.uk/chembl/
 
+## Citation
 
+If you use this code, please cite:
+
+```bibtex
+@mastersthesis{halla2026seal,
+  title={Learning Molecular Representations for ADME Prediction and Interpretability: 
+         A Case Study on Aurora Kinase Inhibitors},
+  author={Halla, Achraf},
+  year={2026},
+  school={Bielefeld University},
+  type={M.Sc. Thesis}
+}
+```
 
 ## References
 
 - Musial et al. (2025). SEAL: Substructure-Explainable Active Learning for Molecular Property Prediction.
+- Liu et al. (2022). GraphBP: Generating 3D Molecules by 3D Molecular Generative Models.
 
+## License
 
+MIT License - see [LICENSE](LICENSE) for details.
