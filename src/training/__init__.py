@@ -1,30 +1,41 @@
 """
-Training utilities for SEAL models.
+SEAL-ADME Training Module.
+
+Provides trainers for multi-task pretraining (classification) and
+finetuning (regression), along with dataset utilities.
 """
 
 from .datasets import (
-    MultiTaskDataset,
-    TaskGraphDataset,
+    PretrainDataset,
+    GraphListDataset,
     BalancedMultiTaskSampler,
-    load_task_datasets,
-    collate_by_task,
+    ProportionalTaskSampler,
+    load_task_graphs,
+    load_all_task_graphs,
+    create_data_loaders,
 )
 
-from .trainer import (
-    BaseTrainer,
-    PretrainTrainer,
-    RegressionTrainer,
+from .pretrain import PretrainTrainer
+
+from .finetune import (
+    FinetuneTrainer,
+    spearman_correlation,
+    pearson_correlation,
 )
 
 __all__ = [
     # Datasets
-    "MultiTaskDataset",
-    "TaskGraphDataset",
+    "PretrainDataset",
+    "GraphListDataset",
     "BalancedMultiTaskSampler",
-    "load_task_datasets",
-    "collate_by_task",
+    "ProportionalTaskSampler",
+    "load_task_graphs",
+    "load_all_task_graphs",
+    "create_data_loaders",
     # Trainers
-    "BaseTrainer",
     "PretrainTrainer",
-    "RegressionTrainer",
+    "FinetuneTrainer",
+    # Utilities
+    "spearman_correlation",
+    "pearson_correlation",
 ]
