@@ -1,39 +1,41 @@
 """
-SEAL model implementations for fragment-aware molecular property prediction.
+SEAL-ADME Models Module.
+
+Provides fragment-aware graph neural networks for molecular property prediction:
+- SEALConv / SEALGINConv: Message passing layers with intra/inter-fragment weights
+- FragmentAwareGCNEncoder / FragmentAwareGINEncoder: Graph encoders
+- MultiTaskPretrainModel: Classification pretraining
+- MultiTaskRegressionModel: Regression finetuning
 """
 
-from .layers import SEALConv, SEALGINConv, GINConv
-from .encoder import FragmentAwareEncoder, GINEncoder, load_encoder
-from .seal import (
-    TaskHead,
-    MLPHead,
-    MultiTaskModel,
-    PretrainModel,
-    RegressionModel,
-    build_model,
+from .layers import SEALConv, SEALGINConv
+
+from .encoder import (
+    FragmentAwareGCNEncoder,
+    FragmentAwareGINEncoder,
+    create_encoder,
+    load_encoder,
 )
-from .random_forest import (
-    RandomForestBaseline,
-    train_rf_baseline,
+
+from .seal import (
+    MultiTaskPretrainModel,
+    MultiTaskRegressionModel,
+    build_pretrain_model,
+    build_finetune_model,
 )
 
 __all__ = [
     # Layers
     "SEALConv",
     "SEALGINConv",
-    "GINConv",
     # Encoders
-    "FragmentAwareEncoder",
-    "GINEncoder",
+    "FragmentAwareGCNEncoder",
+    "FragmentAwareGINEncoder",
+    "create_encoder",
     "load_encoder",
     # Models
-    "TaskHead",
-    "MLPHead",
-    "MultiTaskModel",
-    "PretrainModel",
-    "RegressionModel",
-    "build_model",
-    # Baselines
-    "RandomForestBaseline",
-    "train_rf_baseline",
+    "MultiTaskPretrainModel",
+    "MultiTaskRegressionModel",
+    "build_pretrain_model",
+    "build_finetune_model",
 ]

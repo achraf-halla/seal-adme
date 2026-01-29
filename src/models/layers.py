@@ -1,41 +1,33 @@
 """
-SEAL-style message passing layers with fragment-aware convolution.
+Graph neural network layers for SEAL framework.
 
-The key innovation is separate linear transformations for intra-fragment
-(within BRICS fragments) and inter-fragment (across broken bonds) messages,
-enabling interpretable fragment-level attributions.
+Implements fragment-aware message passing with separate transformations
+for intra-fragment and inter-fragment edges.
 """
-
-from typing import Union, Tuple
 
 import torch
 import torch.nn as nn
-from torch import Tensor
 from torch_geometric.nn import MessagePassing
 
 
 class SEALConv(MessagePassing):
     """
-    SEAL Convolution Layer with fragment-aware message passing.
+    SEAL-style GCN convolution with separate intra/inter-fragment weights.
     
-    For each edge, the layer applies different linear transformations
-    depending on whether the edge is within a BRICS fragment (intra)
-    or crosses a fragment boundary (inter).
-    
-    This design enables the model to learn different representations
-    for local chemical environments vs. fragment interactions, which
-    is crucial for interpretability.
+    For edges within fragments, uses lin_neighbours.
+    For edges crossing fragment boundaries, uses lin_outside.
+    This enables interpretable fragment-level attributions.
     
     Args:
-        in_channels: Size of input features (or tuple for bipartite)
-        out_channels: Size of output features
+        in_channels: Input feature dimension
+        out_channels: Output feature dimension
         aggr: Aggregation scheme ('mean', 'add', 'max')
-        bias: Whether to include bias terms
+        bias: Whether to use bias in linear layers
     """
     
     def __init__(
         self,
-        in_channels: Union[int, Tuple[int, int]],
+        in_channels: int,
         out_channels: int,
         aggr: str = "mean",
         bias: bool = True,
@@ -46,113 +38,78 @@ class SEALConv(MessagePassing):
         if isinstance(in_channels, int):
             in_channels = (in_channels, in_channels)
         
-        # Linear transform for neighbors within same fragment
-        self.lin_intra = nn.Linear(in_channels[0], out_channels, bias=bias)
-        
-        # Linear transform for neighbors in different fragments
-        self.lin_inter = nn.Linear(in_channels[0], out_channels, bias=bias)
-        
-        # Linear transform for self (root node)
+        self.lin_neighbours = nn.Linear(in_channels[0], out_channels, bias=bias)
+        self.lin_outside = nn.Linear(in_channels[0], out_channels, bias=bias)
         self.lin_root = nn.Linear(in_channels[1], out_channels, bias=False)
         
-        self._edge_mask = None
         self.reset_parameters()
     
     def reset_parameters(self):
-        """Initialize parameters."""
         super().reset_parameters()
-        self.lin_intra.reset_parameters()
-        self.lin_inter.reset_parameters()
+        self.lin_neighbours.reset_parameters()
+        self.lin_outside.reset_parameters()
         self.lin_root.reset_parameters()
     
-    def forward(
-        self,
-        x: Union[Tensor, Tuple[Tensor, Tensor]],
-        edge_index: Tensor,
-        edge_brics_mask: Tensor
-    ) -> Tensor:
+    def forward(self, x, edge_index, edge_brics_mask):
         """
         Forward pass with fragment-aware message passing.
         
         Args:
-            x: Node features [num_nodes, in_channels]
-            edge_index: Edge connectivity [2, num_edges]
-            edge_brics_mask: Boolean mask where True indicates edge is
-                            within a fragment (not broken by BRICS)
-                            
-        Returns:
-            Updated node features [num_nodes, out_channels]
-        """
-        if isinstance(x, Tensor):
-            x = (x, x)
-        
-        # Pre-compute transformed features
-        x_intra = self.lin_intra(x[0])
-        x_inter = self.lin_inter(x[0])
-        x_root = self.lin_root(x[1])
-        
-        # Store mask for message function
-        self._edge_mask = edge_brics_mask
-        
-        # Propagate messages
-        out = self.propagate(edge_index, x_intra=x_intra, x_inter=x_inter)
-        
-        # Add root (self) contribution
-        return out + x_root
-    
-    def message(self, x_intra_j: Tensor, x_inter_j: Tensor) -> Tensor:
-        """
-        Compute messages using fragment-aware routing.
-        
-        Args:
-            x_intra_j: Transformed features for intra-fragment edges
-            x_inter_j: Transformed features for inter-fragment edges
+            x: Node features [N, in_channels]
+            edge_index: Edge connectivity [2, E]
+            edge_brics_mask: Boolean mask, True for intra-fragment edges
             
         Returns:
-            Messages to aggregate
+            Updated node features [N, out_channels]
         """
-        # Select intra-fragment or inter-fragment representation
-        # based on whether edge crosses fragment boundary
+        if isinstance(x, torch.Tensor):
+            x = (x, x)
+        
+        x_in = self.lin_neighbours(x[0])
+        x_out = self.lin_outside(x[0])
+        x_root = self.lin_root(x[1])
+        
+        self._edge_brics_mask = edge_brics_mask
+        out = self.propagate(edge_index, x_in=x_in, x_out=x_out)
+        
+        return out + x_root
+    
+    def message(self, x_in_j, x_out_j):
+        """Select message based on edge type."""
         return torch.where(
-            self._edge_mask.unsqueeze(-1),
-            x_intra_j,  # Edge within fragment
-            x_inter_j   # Edge crosses fragment boundary
+            self._edge_brics_mask.unsqueeze(-1),
+            x_in_j,
+            x_out_j
         )
     
-    @property
-    def inter_weights(self) -> Tensor:
-        """Get inter-fragment linear weights (for regularization)."""
-        return self.lin_inter.weight
+    def weights_seal_outside(self):
+        """Get inter-fragment weights for regularization."""
+        return self.lin_outside.weight
     
-    @property
-    def inter_bias(self) -> Tensor:
-        """Get inter-fragment linear bias (for regularization)."""
-        return self.lin_inter.bias
+    def bias_seal_outside(self):
+        """Get inter-fragment bias for regularization."""
+        return self.lin_outside.bias
 
 
 class SEALGINConv(MessagePassing):
     """
-    SEAL-GIN Convolution Layer with fragment-aware message passing.
+    SEAL-style GIN convolution with separate intra/inter-fragment MLPs.
     
-    Uses separate MLPs for intra-fragment and inter-fragment messages,
-    providing more expressive power than SEALConv while maintaining
-    interpretability through fragment-level attributions.
-    
-    This is the GIN variant from Musial et al. (2025) extended with
-    BRICS fragment awareness.
+    Uses Graph Isomorphism Network architecture with learnable epsilon,
+    but applies different MLPs for intra-fragment vs inter-fragment edges.
     
     Args:
-        in_channels: Size of input features (or tuple for bipartite)
-        out_channels: Size of output features
-        aggr: Aggregation scheme (default: 'add' for GIN)
-        eps: Initial epsilon value for self-loop weighting
-        train_eps: Whether to learn epsilon
-        bias: Whether to include bias terms
+        in_channels: Input feature dimension
+        out_channels: Output feature dimension
+        aggr: Aggregation scheme (default 'add' for GIN)
+        eps: Initial epsilon value
+        train_eps: Whether epsilon is trainable
+        bias: Whether to use bias
     """
     
     def __init__(
         self,
-        in_channels: Union[int, Tuple[int, int]],
+        in_channels: int,
         out_channels: int,
         aggr: str = "add",
         eps: float = 1e-3,
@@ -165,105 +122,76 @@ class SEALGINConv(MessagePassing):
         if isinstance(in_channels, int):
             in_channels = (in_channels, in_channels)
         
-        # Learnable or fixed epsilon
         self.initial_eps = eps
         if train_eps:
-            self.eps = nn.Parameter(torch.tensor([eps]))
+            self.eps = nn.Parameter(torch.Tensor([eps]))
         else:
-            self.register_buffer('eps', torch.tensor([eps]))
+            self.register_buffer('eps', torch.Tensor([eps]))
         
-        # MLP for intra-fragment (neighbor) messages
-        self.mlp_intra = nn.Sequential(
+        # MLP for intra-fragment messages
+        self.mlp_neighbours = nn.Sequential(
             nn.Linear(in_channels[0], out_channels, bias=bias),
             nn.ReLU(),
             nn.Linear(out_channels, out_channels, bias=bias)
         )
         
-        # MLP for inter-fragment (outside) messages
-        self.mlp_inter = nn.Sequential(
+        # MLP for inter-fragment messages
+        self.mlp_outside = nn.Sequential(
             nn.Linear(in_channels[0], out_channels, bias=bias),
             nn.ReLU(),
             nn.Linear(out_channels, out_channels, bias=bias)
         )
         
-        # Linear transform for root node
         self.lin_root = nn.Linear(in_channels[1], out_channels, bias=False)
         
-        self._edge_mask = None
         self.reset_parameters()
     
     def reset_parameters(self):
-        """Initialize parameters."""
         super().reset_parameters()
         self.eps.data.fill_(self.initial_eps)
-        for layer in self.mlp_intra:
+        for layer in self.mlp_neighbours:
             if hasattr(layer, 'reset_parameters'):
                 layer.reset_parameters()
-        for layer in self.mlp_inter:
+        for layer in self.mlp_outside:
             if hasattr(layer, 'reset_parameters'):
                 layer.reset_parameters()
         self.lin_root.reset_parameters()
     
-    def forward(
-        self,
-        x: Union[Tensor, Tuple[Tensor, Tensor]],
-        edge_index: Tensor,
-        edge_brics_mask: Tensor
-    ) -> Tensor:
+    def forward(self, x, edge_index, edge_brics_mask):
         """
-        Forward pass with GIN-style fragment-aware aggregation.
+        Forward pass with fragment-aware GIN message passing.
         
         Args:
-            x: Node features [num_nodes, in_channels]
-            edge_index: Edge connectivity [2, num_edges]
-            edge_brics_mask: Boolean mask where True indicates edge is
-                            within a fragment (not broken by BRICS)
-                            
+            x: Node features [N, in_channels]
+            edge_index: Edge connectivity [2, E]
+            edge_brics_mask: Boolean mask, True for intra-fragment edges
+            
         Returns:
-            Updated node features [num_nodes, out_channels]
+            Updated node features [N, out_channels]
         """
-        if isinstance(x, Tensor):
+        if isinstance(x, torch.Tensor):
             x = (x, x)
         
-        self._edge_mask = edge_brics_mask
-        
-        # Aggregate neighbor messages with fragment-aware routing
+        self._edge_brics_mask = edge_brics_mask
         out = self.propagate(edge_index, x=x[0])
-        
-        # Add weighted self-loop (GIN update)
         out = out + (1 + self.eps) * self.lin_root(x[1])
         
         return out
     
-    def message(self, x_j: Tensor) -> Tensor:
-        """
-        Compute messages using fragment-aware MLP routing.
-        
-        Args:
-            x_j: Source node features
-            
-        Returns:
-            Messages to aggregate
-        """
-        msg_intra = self.mlp_intra(x_j)
-        msg_inter = self.mlp_inter(x_j)
-        
+    def message(self, x_j):
+        """Apply appropriate MLP based on edge type."""
+        msg_neighbours = self.mlp_neighbours(x_j)
+        msg_outside = self.mlp_outside(x_j)
         return torch.where(
-            self._edge_mask.unsqueeze(-1),
-            msg_intra,  # Edge within fragment
-            msg_inter   # Edge crosses fragment boundary
+            self._edge_brics_mask.unsqueeze(-1),
+            msg_neighbours,
+            msg_outside
         )
     
-    @property
-    def inter_weights(self) -> Tensor:
-        """Get inter-fragment MLP weights (for regularization)."""
-        return self.mlp_inter[0].weight
+    def weights_seal_outside(self):
+        """Get first layer weights of inter-fragment MLP for regularization."""
+        return self.mlp_outside[0].weight
     
-    @property
-    def inter_bias(self) -> Tensor:
-        """Get inter-fragment MLP bias (for regularization)."""
-        return self.mlp_inter[0].bias
-
-
-# Alias for backward compatibility
-GINConv = SEALGINConv
+    def bias_seal_outside(self):
+        """Get first layer bias of inter-fragment MLP for regularization."""
+        return self.mlp_outside[0].bias
