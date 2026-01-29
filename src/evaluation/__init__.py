@@ -1,82 +1,42 @@
 """
-Evaluation and interpretability utilities for SEAL models.
+SEAL-ADME Evaluation Module.
+
+Provides utilities for extracting and visualizing model explanations:
+- Fragment-level attribution extraction
+- Molecular visualization with importance coloring
 """
 
 from .explanations import (
     extract_explanations,
-    save_explanations,
+    extract_explanations_all_tasks,
     load_explanations,
-    aggregate_fragment_importance,
+    explanations_to_dataframe,
     get_top_fragments,
 )
 
 from .visualization import (
-    prepare_colors,
+    get_smiles_from_explanation,
+    prepare_atom_colors,
+    save_colorbar,
     draw_molecule_svg,
     visualize_explanation,
     visualize_explanations,
-    create_summary_figure,
-)
-
-from .analysis import (
-    TASK_LABELS,
-    TASK_UNITS,
-    load_predictions,
-    load_smiles_mapping,
-    compute_task_correlations,
-    compare_correlations,
-    compute_sa_score,
-    compute_sa_scores_batch,
-    find_pareto_front,
-    pareto_rank,
-    ParetoAnalyzer,
-    compare_models,
-    ensemble_predictions,
-)
-
-from .inference import (
-    predict_task,
-    predict_all_tasks,
-    evaluate_predictions,
-    extract_drug_ids,
-    save_predictions_csv,
-    InferenceRunner,
-    load_graphs_from_directory,
+    visualize_all_tasks,
 )
 
 __all__ = [
     # Explanations
     "extract_explanations",
-    "save_explanations",
+    "extract_explanations_all_tasks",
     "load_explanations",
-    "aggregate_fragment_importance",
+    "explanations_to_dataframe",
     "get_top_fragments",
     # Visualization
-    "prepare_colors",
+    "get_smiles_from_explanation",
+    "prepare_atom_colors",
+    "save_colorbar",
     "draw_molecule_svg",
     "visualize_explanation",
     "visualize_explanations",
-    "create_summary_figure",
-    # Analysis
-    "TASK_LABELS",
-    "TASK_UNITS",
-    "load_predictions",
-    "load_smiles_mapping",
-    "compute_task_correlations",
-    "compare_correlations",
-    "compute_sa_score",
-    "compute_sa_scores_batch",
-    "find_pareto_front",
-    "pareto_rank",
-    "ParetoAnalyzer",
-    "compare_models",
-    "ensemble_predictions",
-    # Inference
-    "predict_task",
-    "predict_all_tasks",
-    "evaluate_predictions",
-    "extract_drug_ids",
-    "save_predictions_csv",
-    "InferenceRunner",
-    "load_graphs_from_directory",
+    "visualize_all_tasks",
 ]
