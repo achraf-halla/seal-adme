@@ -56,11 +56,9 @@ def validate_smiles_column(
     """
     df = df.copy()
     
-    # Count missing/blank SMILES
     n_missing = df[smiles_col].isna().sum()
     n_blank = (df[smiles_col].astype(str).str.strip() == "").sum()
     
-    # Canonicalize
     df[output_col] = df[smiles_col].map(canonicalize_smiles)
     
     n_valid = df[output_col].notna().sum()
@@ -118,11 +116,9 @@ def deduplicate_by_label_consistency(
     for name, group in grouped:
         labels_norm = set(group[label_col].map(normalize_label).unique())
         if len(labels_norm) == 1:
-            # Consistent labels - keep first row
             keep_indices.append(group.index[0])
             keep_groups += 1
         else:
-            # Conflicting labels - drop entire group
             drop_groups += 1
             dropped_rows += len(group)
     
@@ -144,52 +140,49 @@ def deduplicate_by_label_consistency(
     return df_dedup, stats
 
 
-def check_drug_id_mapping(
+def standardize_dataframe(
     df: pd.DataFrame,
-    task_col: str = "task_name",
-    drug_id_col: str = "Drug_ID",
-    smiles_col: str = "canonical_smiles"
-) -> Dict[str, Any]:
+    smiles_col: str = "original_smiles",
+    drop_invalid: bool = True,
+    deduplicate: bool = True
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Check if Drug_ID maps uniquely to canonical_smiles within each task.
+    Apply full standardization pipeline to a DataFrame.
+    
+    Pipeline:
+    1. Validate and canonicalize SMILES
+    2. Drop invalid SMILES (optional)
+    3. Deduplicate by label consistency (optional)
     
     Args:
         df: Input DataFrame
-        task_col: Column containing task names
-        drug_id_col: Column containing drug IDs
-        smiles_col: Column containing canonical SMILES
+        smiles_col: Column containing SMILES
+        drop_invalid: Whether to drop rows with invalid SMILES
+        deduplicate: Whether to deduplicate by label consistency
         
     Returns:
-        Dictionary with mapping statistics per task
+        Tuple of (standardized DataFrame, processing stats)
     """
-    df = df.copy()
-    df["_drug_id_str"] = df[drug_id_col].map(
-        lambda x: "" if pd.isna(x) else str(x).strip()
-    )
+    stats = {"input_rows": len(df)}
     
-    results = {}
-    tasks = df[task_col].unique()
+    # Validate and canonicalize
+    df, val_stats = validate_smiles_column(df, smiles_col, "canonical_smiles")
+    stats["validation"] = val_stats
     
-    for task in tasks:
-        sub = df[df[task_col] == task]
-        per_drug = sub.groupby("_drug_id_str")[smiles_col].nunique()
-        
-        n_drug_ids = len(per_drug)
-        n_single = int((per_drug == 1).sum())
-        n_multi = int((per_drug > 1).sum())
-        
-        results[task] = {
-            "n_drug_ids": n_drug_ids,
-            "n_single_smiles": n_single,
-            "n_multi_smiles": n_multi
-        }
-        
-        if n_multi > 0:
-            logger.warning(
-                f"Task '{task}': {n_multi} Drug_IDs map to multiple SMILES"
-            )
+    # Drop invalid
+    if drop_invalid:
+        n_before = len(df)
+        df = df[df["canonical_smiles"].notna()].copy()
+        stats["dropped_invalid"] = n_before - len(df)
     
-    return results
+    # Deduplicate
+    if deduplicate:
+        df, dedup_stats = deduplicate_by_label_consistency(df)
+        stats["deduplication"] = dedup_stats
+    
+    stats["output_rows"] = len(df)
+    
+    return df, stats
 
 
 class DataPreprocessor:
@@ -209,7 +202,7 @@ class DataPreprocessor:
         Initialize preprocessor.
         
         Args:
-            input_dir: Directory containing validated CSV files
+            input_dir: Directory containing input CSV files
             output_dir: Directory to save preprocessed files
             smiles_col: Name of SMILES column
         """
@@ -242,26 +235,12 @@ class DataPreprocessor:
         df = self._read_csv(input_path)
         logger.info(f"Processing {filename}: {len(df)} rows")
         
-        stats = {"input_rows": len(df)}
-        
-        # Validate and canonicalize SMILES
-        df, val_stats = validate_smiles_column(
-            df, self.smiles_col, "canonical_smiles"
+        df, stats = standardize_dataframe(
+            df,
+            smiles_col=self.smiles_col,
+            drop_invalid=drop_invalid,
+            deduplicate=deduplicate
         )
-        stats["validation"] = val_stats
-        
-        # Drop invalid SMILES
-        if drop_invalid:
-            n_before = len(df)
-            df = df[df["canonical_smiles"].notna()].copy()
-            stats["dropped_invalid"] = n_before - len(df)
-        
-        # Deduplicate
-        if deduplicate:
-            df, dedup_stats = deduplicate_by_label_consistency(df)
-            stats["deduplication"] = dedup_stats
-        
-        stats["output_rows"] = len(df)
         
         return df, stats
     
@@ -278,5 +257,12 @@ class DataPreprocessor:
         """Save processed DataFrame."""
         path = self.output_dir / filename
         df.to_csv(path, index=False)
+        logger.info(f"Saved {len(df)} rows to {path}")
+        return path
+    
+    def save_parquet(self, df: pd.DataFrame, filename: str) -> Path:
+        """Save processed DataFrame as parquet."""
+        path = self.output_dir / filename
+        df.to_parquet(path, index=False)
         logger.info(f"Saved {len(df)} rows to {path}")
         return path

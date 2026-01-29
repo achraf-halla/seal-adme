@@ -1,20 +1,33 @@
 """
-Constants for molecular featurization and data processing.
+Constants for SEAL-ADME data processing and model configuration.
 """
 
-# TDC task definitions
+# TDC pretraining tasks (classification only)
 PRETRAIN_TASKS = [
-    'hia_hou', 'pgp_broccatelli', 'bioavailability_ma', 'lipophilicity_astrazeneca',
-    'bbb_martins', 'ppbr_az', 'vdss_lombardo', 'cyp2d6_veith', 'cyp3a4_veith',
-    'cyp2c9_veith', 'cyp2d6_substrate_carbonmangels', 'cyp3a4_substrate_carbonmangels',
-    'cyp2c9_substrate_carbonmangels', 'clearance_microsome_az', 'clearance_hepatocyte_az'
+    'hia_hou',
+    'pgp_broccatelli',
+    'bioavailability_ma',
+    'bbb_martins',
+    'cyp2d6_veith',
+    'cyp3a4_veith',
+    'cyp2c9_veith',
+    'cyp2d6_substrate_carbonmangels',
+    'cyp3a4_substrate_carbonmangels',
+    'cyp2c9_substrate_carbonmangels',
 ]
 
-FINETUNE_TASKS = ['solubility_aqsoldb', 'caco2_wang', 'half_life_obach']
+# TDC finetuning tasks (regression)
+FINETUNE_TASKS = [
+    'solubility_aqsoldb',
+    'caco2_wang',
+    'half_life_obach',
+]
 
-# Atom featurization
-DEFAULT_ATOM_TYPE_SET = ["C", "N", "O", "F", "Cl", "Br", "P", "S", "B", "I", "Unk"]
-DEFAULT_HYBRIDIZATION_SET = ["SP", "SP2", "SP3", "Other"]
+# Atom type vocabulary for node features
+ATOM_TYPE_SET = ["C", "N", "O", "F", "Cl", "Br", "P", "S", "B", "I", "Unk"]
+
+# Hybridization types
+HYBRIDIZATION_SET = ["SP", "SP2", "SP3", "Other"]
 
 # Pauling electronegativity values
 PAULING_ELECTRONEGATIVITY = {
@@ -26,18 +39,23 @@ DEFAULT_ELECTRONEGATIVITY = 2.50
 # Halogen atomic numbers for BRICS decomposition
 HALOGEN_ATOMIC_NUMS = {9, 17, 35, 53, 85, 117}
 
-# Morgan fingerprint defaults
-FP_NBITS = 2048
-FP_RADIUS = 2
+# Standard column names for data processing
+META_COLUMNS = [
+    'Drug_ID', 'original_smiles', 'Y', 'task_name', 'source', 'task', 'canonical_smiles'
+]
 
-# Standard column names
 STANDARD_COLUMNS = [
     'Drug_ID', 'original_smiles', 'Y', 'task_name', 'source', 'task'
 ]
 
-GRAPH_COLUMNS = [
-    'Drug_ID', 'task_name', 'source', 'task', 'canonical_smiles', 'Y'
-]
-
 # Aurora kinase target search terms
 AURORA_SEARCH_TERMS = ["AURKA", "AURKB", "AURKC", "Aurora kinase"]
+
+# Default split fractions
+DEFAULT_SPLIT_FRACTIONS = [0.8, 0.1, 0.1]  # train, valid, test
+
+# Model defaults
+DEFAULT_HIDDEN_DIM = 256
+DEFAULT_NUM_LAYERS = 4
+DEFAULT_DROPOUT = 0.1
+DEFAULT_INPUT_FEATURES = 25

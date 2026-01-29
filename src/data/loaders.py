@@ -90,9 +90,23 @@ class TDCLoader:
             return pd.concat(dfs, ignore_index=True)
         return pd.DataFrame(columns=STANDARD_COLUMNS)
     
-    def load_pretrain(self) -> pd.DataFrame:
-        """Load all pretraining tasks."""
-        return self.load_tasks(PRETRAIN_TASKS, "pretrain")
+    def load_pretrain(self, classification_only: bool = True) -> pd.DataFrame:
+        """
+        Load pretraining tasks.
+        
+        Args:
+            classification_only: If True, filter to classification tasks only
+            
+        Returns:
+            DataFrame with pretraining data
+        """
+        df = self.load_tasks(PRETRAIN_TASKS, "pretrain")
+        
+        if classification_only and len(df) > 0:
+            df = df[df["task"] == "classification"].copy()
+            logger.info(f"Filtered to classification tasks: {len(df)} rows")
+        
+        return df
     
     def load_finetune(self) -> pd.DataFrame:
         """Load all finetuning tasks."""
@@ -141,10 +155,8 @@ class ChEMBLAuroraLoader:
         client = self._get_client()
         target_client = client.target
         
-        # Search by preferred name
         pref = list(target_client.filter(pref_name__icontains="Aurora"))
         
-        # Search by synonyms
         syn = []
         for term in AURORA_SEARCH_TERMS:
             try:
@@ -277,31 +289,53 @@ def filter_aurora_data(
     """
     logger.info(f"Starting with {len(df)} rows")
     
-    # Keep only exact measurements
     if "standard_relation" in df.columns:
         df = df[df["standard_relation"] == "="].copy()
         logger.info(f"After relation filter: {len(df)} rows")
     
-    # Keep targets with sufficient data
     if "target_chembl_id" in df.columns:
         counts = df["target_chembl_id"].value_counts(dropna=True)
         keep_ids = counts[counts > min_target_count].index.tolist()
         df = df[df["target_chembl_id"].isin(keep_ids)].copy()
         logger.info(f"After target count filter (>{min_target_count}): {len(df)} rows")
     
-    # Filter by organism
     if "assay_organism" in df.columns and organism:
         df = df[df["assay_organism"] == organism].copy()
         logger.info(f"After organism filter ({organism}): {len(df)} rows")
     
-    # Filter by assay type
     if "assay_type" in df.columns and assay_type:
         df = df[df["assay_type"] == assay_type].copy()
         logger.info(f"After assay type filter ({assay_type}): {len(df)} rows")
     
-    # Require pChEMBL values
     if require_pchembl and "pchembl_value" in df.columns:
         df = df[~df["pchembl_value"].isna()].copy()
         logger.info(f"After pChEMBL filter: {len(df)} rows")
     
     return df
+
+
+def convert_aurora_to_standard(df: pd.DataFrame, task_name: str = "aurora") -> pd.DataFrame:
+    """
+    Convert Aurora kinase data to standard format.
+    
+    Args:
+        df: Filtered Aurora DataFrame
+        task_name: Name for the task (will use target_chembl_id if available)
+        
+    Returns:
+        DataFrame with standard columns
+    """
+    records = []
+    
+    for _, row in df.iterrows():
+        target = row.get("target_chembl_id", task_name)
+        records.append({
+            "Drug_ID": row.get("molecule_chembl_id", ""),
+            "original_smiles": row.get("canonical_smiles", ""),
+            "Y": row.get("pchembl_value", row.get("standard_value", 0)),
+            "task_name": target,
+            "source": "chembl",
+            "task": "regression"
+        })
+    
+    return pd.DataFrame(records)

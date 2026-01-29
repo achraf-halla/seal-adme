@@ -1,27 +1,37 @@
 """
-Data processing pipeline for SEAL-ADME.
+SEAL-ADME Data Processing Module.
 
 This module provides utilities for:
 - Loading data from TDC and ChEMBL
-- SMILES validation and canonicalization
-- Molecular featurization (descriptors and fingerprints)
-- BRICS-based fragmentation
-- PyTorch Geometric graph creation
+- SMILES validation and standardization
+- Scaffold-based data splitting
+- BRICS molecular fragmentation
+- PyG graph construction
 """
 
 from .constants import (
     PRETRAIN_TASKS,
     FINETUNE_TASKS,
-    DEFAULT_ATOM_TYPE_SET,
-    DEFAULT_HYBRIDIZATION_SET,
-    FP_NBITS,
-    FP_RADIUS,
+    ATOM_TYPE_SET,
+    HYBRIDIZATION_SET,
+    PAULING_ELECTRONEGATIVITY,
+    DEFAULT_ELECTRONEGATIVITY,
+    HALOGEN_ATOMIC_NUMS,
+    META_COLUMNS,
+    STANDARD_COLUMNS,
+    AURORA_SEARCH_TERMS,
+    DEFAULT_SPLIT_FRACTIONS,
+    DEFAULT_HIDDEN_DIM,
+    DEFAULT_NUM_LAYERS,
+    DEFAULT_DROPOUT,
+    DEFAULT_INPUT_FEATURES,
 )
 
 from .loaders import (
     TDCLoader,
     ChEMBLAuroraLoader,
     filter_aurora_data,
+    convert_aurora_to_standard,
     infer_task_type,
 )
 
@@ -29,24 +39,28 @@ from .preprocessing import (
     canonicalize_smiles,
     validate_smiles_column,
     deduplicate_by_label_consistency,
+    standardize_dataframe,
     DataPreprocessor,
 )
 
-from .featurization import (
-    MorganFingerprintCalculator,
-    RDKitDescriptorCalculator,
-    MolecularFeaturizer,
-    impute_missing_descriptors,
+from .splitting import (
+    create_scaffold_split,
+    create_random_split,
+    split_by_task,
 )
 
 from .fragmentation import (
     brics_decompose,
+    get_fragment_membership_matrix,
+    get_edge_break_mask,
     FragmentExtractor,
 )
 
-from .graph_featurizer import (
-    AtomFeaturizer,
-    GraphFeaturizer,
+from .graph_builder import (
+    one_hot_encode,
+    get_atom_features,
+    mol_to_graph,
+    GraphBuilder,
     save_graphs,
     load_graphs,
 )
@@ -54,32 +68,46 @@ from .graph_featurizer import (
 __all__ = [
     # Constants
     "PRETRAIN_TASKS",
-    "FINETUNE_TASKS", 
-    "DEFAULT_ATOM_TYPE_SET",
-    "DEFAULT_HYBRIDIZATION_SET",
-    "FP_NBITS",
-    "FP_RADIUS",
+    "FINETUNE_TASKS",
+    "ATOM_TYPE_SET",
+    "HYBRIDIZATION_SET",
+    "PAULING_ELECTRONEGATIVITY",
+    "DEFAULT_ELECTRONEGATIVITY",
+    "HALOGEN_ATOMIC_NUMS",
+    "META_COLUMNS",
+    "STANDARD_COLUMNS",
+    "AURORA_SEARCH_TERMS",
+    "DEFAULT_SPLIT_FRACTIONS",
+    "DEFAULT_HIDDEN_DIM",
+    "DEFAULT_NUM_LAYERS",
+    "DEFAULT_DROPOUT",
+    "DEFAULT_INPUT_FEATURES",
     # Loaders
     "TDCLoader",
     "ChEMBLAuroraLoader",
     "filter_aurora_data",
+    "convert_aurora_to_standard",
     "infer_task_type",
     # Preprocessing
     "canonicalize_smiles",
     "validate_smiles_column",
     "deduplicate_by_label_consistency",
+    "standardize_dataframe",
     "DataPreprocessor",
-    # Featurization
-    "MorganFingerprintCalculator",
-    "RDKitDescriptorCalculator",
-    "MolecularFeaturizer",
-    "impute_missing_descriptors",
+    # Splitting
+    "create_scaffold_split",
+    "create_random_split",
+    "split_by_task",
     # Fragmentation
     "brics_decompose",
+    "get_fragment_membership_matrix",
+    "get_edge_break_mask",
     "FragmentExtractor",
-    # Graph featurization
-    "AtomFeaturizer",
-    "GraphFeaturizer",
+    # Graph building
+    "one_hot_encode",
+    "get_atom_features",
+    "mol_to_graph",
+    "GraphBuilder",
     "save_graphs",
     "load_graphs",
 ]

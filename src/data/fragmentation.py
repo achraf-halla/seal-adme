@@ -34,7 +34,6 @@ def brics_decompose(mol) -> Tuple[List[List[int]], List[List[int]]]:
     
     n_atoms = mol.GetNumAtoms()
     
-    # Handle single atom molecules
     if n_atoms == 1:
         return [[0]], []
     
@@ -79,7 +78,6 @@ def brics_decompose(mol) -> Tuple[List[List[int]], List[List[int]]]:
             atom0_in_ring = mol.GetAtomWithIdx(atom0).IsInRing()
             atom1_in_ring = mol.GetAtomWithIdx(atom1).IsInRing()
             
-            # Ring to non-ring bond
             if atom0_in_ring and not atom1_in_ring:
                 cliques_to_remove.append(c)
                 cliques.append([atom1])
@@ -88,7 +86,6 @@ def brics_decompose(mol) -> Tuple[List[List[int]], List[List[int]]]:
                 cliques_to_remove.append(c)
                 cliques.append([atom0])
                 breaks.append(c)
-            # Bond between different ring systems
             elif (atom0_in_ring and atom1_in_ring and 
                   not (atom_to_rings[atom0] & atom_to_rings[atom1])):
                 cliques_to_remove.append(c)
@@ -173,6 +170,58 @@ def _merge_overlapping_cliques(cliques: List[List[int]]) -> List[List[int]]:
         cliques = new_cliques
     
     return [c for c in cliques if len(c) > 0]
+
+
+def get_fragment_membership_matrix(
+    n_atoms: int,
+    cliques: List[List[int]]
+) -> List[List[float]]:
+    """
+    Create fragment membership matrix S.
+    
+    Args:
+        n_atoms: Number of atoms in molecule
+        cliques: List of atom index lists for each fragment
+        
+    Returns:
+        Matrix S where S[i][j] = 1.0 if atom i belongs to fragment j
+    """
+    n_fragments = len(cliques)
+    S = [[0.0] * n_fragments for _ in range(n_atoms)]
+    
+    for frag_idx, frag_atoms in enumerate(cliques):
+        for atom_idx in frag_atoms:
+            if 0 <= atom_idx < n_atoms:
+                S[atom_idx][frag_idx] = 1.0
+    
+    return S
+
+
+def get_edge_break_mask(
+    edge_index: List[Tuple[int, int]],
+    breaks: List[List[int]]
+) -> List[bool]:
+    """
+    Create mask for edges that cross fragment boundaries.
+    
+    Args:
+        edge_index: List of (src, dst) edge tuples
+        breaks: List of broken bond pairs from decomposition
+        
+    Returns:
+        Boolean mask where True = edge is within fragment
+    """
+    break_set = set()
+    for b in breaks:
+        break_set.add((b[0], b[1]))
+        break_set.add((b[1], b[0]))
+    
+    mask = []
+    for src, dst in edge_index:
+        is_within_fragment = (src, dst) not in break_set
+        mask.append(is_within_fragment)
+    
+    return mask
 
 
 class FragmentExtractor:
@@ -270,7 +319,6 @@ class FragmentExtractor:
             return "_".join(sorted(symbols))
             
         except Exception:
-            # Ultimate fallback
             try:
                 symbols = [mol.GetAtomWithIdx(i).GetSymbol() for i in atom_indices]
                 return "_".join(sorted(symbols))
@@ -278,28 +326,26 @@ class FragmentExtractor:
                 return f"FRAGMENT_{len(atom_indices)}_ATOMS"
     
     @staticmethod
-    def compute_fragment_fingerprint(smiles: str, radius: int = 2) -> Optional[str]:
+    def extract_all_fragments(mol, cliques: List[List[int]]) -> List[dict]:
         """
-        Compute Morgan fingerprint hash for a fragment.
+        Extract SMILES and metadata for all fragments.
         
         Args:
-            smiles: Fragment SMILES
-            radius: Fingerprint radius
+            mol: RDKit Mol object
+            cliques: List of atom index lists for each fragment
             
         Returns:
-            String hash of fingerprint or None
+            List of dicts with 'smiles', 'atom_indices', 'size' keys
         """
-        from rdkit import Chem
-        from rdkit.Chem import AllChem
+        fragments = []
         
-        if smiles is None:
-            return None
+        for frag_idx, atom_indices in enumerate(cliques):
+            smiles = FragmentExtractor.extract_fragment_smiles(mol, atom_indices)
+            fragments.append({
+                'fragment_idx': frag_idx,
+                'smiles': smiles,
+                'atom_indices': atom_indices,
+                'size': len(atom_indices)
+            })
         
-        try:
-            mol = Chem.MolFromSmiles(smiles)
-            if mol is None:
-                return None
-            fp = AllChem.GetMorganFingerprint(mol, radius=radius)
-            return str(hash(tuple(sorted(fp.GetNonzeroElements().items()))))
-        except Exception:
-            return None
+        return fragments
