@@ -1,107 +1,32 @@
-# Data processing configuration for SEAL-ADME
-# This file defines the data pipeline parameters
+# SEAL-ADME Data Configuration
 
-# Directory structure
-paths:
-  raw_dir: "data/raw"
-  validated_dir: "data/validated"
-  preprocessed_dir: "data/preprocessed"
-  features_dir: "data/features"
-  graphs_dir: "data/graphs"
-
-# TDC data loading
+# TDC dataset settings
 tdc:
-  pretrain_tasks:
-    - hia_hou
-    - pgp_broccatelli
-    - bioavailability_ma
-    - lipophilicity_astrazeneca
-    - bbb_martins
-    - ppbr_az
-    - vdss_lombardo
-    - cyp2d6_veith
-    - cyp3a4_veith
-    - cyp2c9_veith
-    - cyp2d6_substrate_carbonmangels
-    - cyp3a4_substrate_carbonmangels
-    - cyp2c9_substrate_carbonmangels
-    - clearance_microsome_az
-    - clearance_hepatocyte_az
-  
-  finetune_tasks:
-    - solubility_aqsoldb
-    - caco2_wang
-    - half_life_obach
+  # Pretraining uses classification tasks only
+  pretrain_classification_only: true
 
-# ChEMBL Aurora kinase data
+# ChEMBL Aurora kinase filters
 chembl:
   aurora_filters:
     min_target_count: 200
     organism: "Homo sapiens"
     assay_type: "B"  # Binding assays
     require_pchembl: true
-    standard_types:
-      - IC50
-      - Ki
 
-# Molecular featurization
-featurization:
-  # Morgan fingerprints
-  fingerprint:
-    n_bits: 2048
-    radius: 2
-  
-  # Descriptor computation
-  descriptors:
-    compute: true
-    impute_strategy: "median"  # median, mean, or zero
-
-# Graph featurization
-graph:
-  # Atom features
-  atom_features:
-    include_optional: true  # degree, charge, aromaticity, hybridization, etc.
-    include_numeric: true   # atomic number, mass, electronegativity
-    include_gasteiger: true # Gasteiger partial charges
-  
-  # Fragment storage
-  store_fragments: true  # Store fragment SMILES for interpretability
-  
-  # Atom types supported
-  atom_types:
-    - C
-    - N
-    - O
-    - F
-    - Cl
-    - Br
-    - P
-    - S
-    - B
-    - I
-    - Unk  # Unknown/other
-  
-  hybridization_types:
-    - SP
-    - SP2
-    - SP3
-    - Other
-
-# Dataset splitting
+# Splitting configuration
 splitting:
-  # For Aurora kinase data
-  aurora:
-    train_ratio: 0.8
-    valid_ratio: 0.1
-    test_ratio: 0.1
-    random_seed: 42
-    stratify_by: null  # or "target_chembl_id" for stratified split
-  
-  # For TDC data (use their provided splits)
-  tdc:
-    use_provided_splits: true
+  seed: 42
+  fractions: [0.8, 0.1, 0.1]  # train, valid, test
+  method: scaffold  # scaffold or random
 
-# Logging
-logging:
-  level: INFO
-  log_file: "data_processing.log"
+# Graph construction
+graph:
+  normalize_y: false  # Normalize target values
+  store_fragments: true  # Store fragment SMILES in graphs
+
+# Output directories (relative to data_dir)
+directories:
+  raw: raw
+  clean: clean
+  splits: splits
+  graphs: graphs
