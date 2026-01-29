@@ -1,101 +1,107 @@
-# =============================================================================
-# SEAL-ADME Data Configuration
-# =============================================================================
-# Configuration for the data preparation pipeline.
-# Used by: scripts/prepare_data.py
+# Data processing configuration for SEAL-ADME
+# This file defines the data pipeline parameters
 
-# -----------------------------------------------------------------------------
-# TDC Dataset Configuration
-# -----------------------------------------------------------------------------
+# Directory structure
+paths:
+  raw_dir: "data/raw"
+  validated_dir: "data/validated"
+  preprocessed_dir: "data/preprocessed"
+  features_dir: "data/features"
+  graphs_dir: "data/graphs"
+
+# TDC data loading
 tdc:
-  # Pretraining tasks (mostly classification)
   pretrain_tasks:
-    # Absorption
     - hia_hou
     - pgp_broccatelli
     - bioavailability_ma
-    # Distribution
+    - lipophilicity_astrazeneca
     - bbb_martins
     - ppbr_az
     - vdss_lombardo
-    # Metabolism (CYP enzymes)
     - cyp2d6_veith
     - cyp3a4_veith
     - cyp2c9_veith
     - cyp2d6_substrate_carbonmangels
     - cyp3a4_substrate_carbonmangels
     - cyp2c9_substrate_carbonmangels
-    # Excretion
     - clearance_microsome_az
     - clearance_hepatocyte_az
-    # Physicochemical
-    - lipophilicity_astrazeneca
   
-  # Finetuning tasks (regression)
   finetune_tasks:
     - solubility_aqsoldb
     - caco2_wang
     - half_life_obach
 
-# -----------------------------------------------------------------------------
-# ChEMBL Aurora Kinase Configuration
-# -----------------------------------------------------------------------------
+# ChEMBL Aurora kinase data
 chembl:
   aurora_filters:
-    # Minimum number of data points per target to include
     min_target_count: 200
-    # Required assay organism
     organism: "Homo sapiens"
-    # Assay type: B = binding, F = functional
-    assay_type: "B"
-    # Require pChEMBL value (standardized potency)
+    assay_type: "B"  # Binding assays
     require_pchembl: true
+    standard_types:
+      - IC50
+      - Ki
 
-# -----------------------------------------------------------------------------
-# Preprocessing Configuration
-# -----------------------------------------------------------------------------
-preprocessing:
-  # Preserve stereochemistry in canonical SMILES
-  isomeric_smiles: true
-  # Remove molecules with conflicting labels
-  deduplicate: true
-  # Drop molecules with invalid SMILES
-  drop_invalid: true
-
-# -----------------------------------------------------------------------------
-# Train/Valid/Test Splitting
-# -----------------------------------------------------------------------------
-splitting:
-  # Method: "scaffold" (Murcko scaffold) or "random"
-  method: scaffold
-  # Split ratios
-  train_ratio: 0.8
-  valid_ratio: 0.1
-  # test_ratio is computed as 1 - train_ratio - valid_ratio
-  # Random seed for reproducibility
-  seed: 42
-
-# -----------------------------------------------------------------------------
-# Graph Featurization
-# -----------------------------------------------------------------------------
-graph:
-  # Atom feature configuration
-  atom_features:
-    # Include degree, charge, aromaticity, hybridization, etc.
-    include_optional: true
-    # Include atomic number, mass, electronegativity
-    include_numeric: true
-    # Compute and include Gasteiger partial charges
-    include_gasteiger: true
+# Molecular featurization
+featurization:
+  # Morgan fingerprints
+  fingerprint:
+    n_bits: 2048
+    radius: 2
   
-  # Store fragment metadata in graph objects
-  # Required for SEAL interpretability
-  store_fragments: true
+  # Descriptor computation
+  descriptors:
+    compute: true
+    impute_strategy: "median"  # median, mean, or zero
 
-# -----------------------------------------------------------------------------
+# Graph featurization
+graph:
+  # Atom features
+  atom_features:
+    include_optional: true  # degree, charge, aromaticity, hybridization, etc.
+    include_numeric: true   # atomic number, mass, electronegativity
+    include_gasteiger: true # Gasteiger partial charges
+  
+  # Fragment storage
+  store_fragments: true  # Store fragment SMILES for interpretability
+  
+  # Atom types supported
+  atom_types:
+    - C
+    - N
+    - O
+    - F
+    - Cl
+    - Br
+    - P
+    - S
+    - B
+    - I
+    - Unk  # Unknown/other
+  
+  hybridization_types:
+    - SP
+    - SP2
+    - SP3
+    - Other
+
+# Dataset splitting
+splitting:
+  # For Aurora kinase data
+  aurora:
+    train_ratio: 0.8
+    valid_ratio: 0.1
+    test_ratio: 0.1
+    random_seed: 42
+    stratify_by: null  # or "target_chembl_id" for stratified split
+  
+  # For TDC data (use their provided splits)
+  tdc:
+    use_provided_splits: true
+
 # Logging
-# -----------------------------------------------------------------------------
 logging:
   level: INFO
-  # Uncomment to log to file
-  # file: logs/data_pipeline.log
+  log_file: "data_processing.log"
