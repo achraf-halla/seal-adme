@@ -1,342 +1,205 @@
 """
-Graph featurization for SEAL-ADME.
+PyTorch Geometric graph featurization with SEAL-style fragment awareness.
 
-This module converts molecules to PyTorch Geometric graph objects with:
-- Rich atom features (type, degree, charge, aromaticity, etc.)
-- Gasteiger partial charges
-- BRICS fragment assignments
-- Inter/intra-fragment edge masks
+This module creates molecular graphs with:
+- Node features (atom properties)
+- Edge indices (bonds)
+- Fragment membership matrices (S matrix for SEAL)
+- Fragment metadata for interpretability
 """
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import torch
+from torch_geometric.data import Data
 
 from .constants import (
     DEFAULT_ATOM_TYPE_SET,
     DEFAULT_HYBRIDIZATION_SET,
     PAULING_ELECTRONEGATIVITY,
     DEFAULT_ELECTRONEGATIVITY,
+    GRAPH_COLUMNS
 )
-from .fragmentation import (
-    FragmentExtractor,
-    brics_decomp_extra,
-    extract_fragment_metadata,
-    create_cluster_assignment_matrix,
-    create_atom_wise_assignment_matrix,
-    mask_broken_edges,
-)
+from .fragmentation import brics_decompose, FragmentExtractor
 
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Atom featurization utilities
-# =============================================================================
-
-def one_hot_encoding(x, allowable_set: List, with_unknown: bool = True) -> List[float]:
+def one_of_k_encoding_unk(x: Any, allowable_set: List) -> List[float]:
     """
-    Create one-hot encoding for a value.
+    One-hot encoding with unknown category.
     
     Args:
         x: Value to encode
-        allowable_set: List of allowed values
-        with_unknown: If True, last position is reserved for unknown values
+        allowable_set: List of allowed values (last is 'unknown')
         
     Returns:
         One-hot encoded list
     """
-    if with_unknown and x not in allowable_set:
-        x = allowable_set[-1]  # Use last element as "unknown"
+    if x not in allowable_set:
+        x = allowable_set[-1]
     return [float(x == s) for s in allowable_set]
 
 
 class AtomFeaturizer:
     """
-    Compute atom-level features for molecules.
+    Compute atom-level features for graph nodes.
     
     Features include:
     - Atom type (one-hot)
-    - Hybridization (one-hot)
     - Degree
     - Formal charge
     - Aromaticity
+    - Hybridization (one-hot)
+    - Implicit valence
     - Ring membership
     - Number of hydrogens
-    - Implicit valence
-    - Numeric features (atomic number, mass, electronegativity, Gasteiger charge)
+    - Atomic number (scaled)
+    - Atomic mass (scaled)
+    - Electronegativity (scaled)
+    - Gasteiger charge
     """
     
     def __init__(
         self,
-        atom_types: List[str] = DEFAULT_ATOM_TYPE_SET,
-        hybridization_types: List[str] = DEFAULT_HYBRIDIZATION_SET,
-        include_degree: bool = True,
-        include_charge: bool = True,
-        include_aromatic: bool = True,
-        include_hybridization: bool = True,
-        include_valence: bool = True,
-        include_ring: bool = True,
-        include_num_hs: bool = True,
+        include_optional: bool = True,
         include_numeric: bool = True,
-        include_gasteiger: bool = True,
+        include_gasteiger: bool = True
     ):
         """
         Initialize atom featurizer.
         
         Args:
-            atom_types: List of atom types for one-hot encoding
-            hybridization_types: List of hybridization types
-            include_*: Flags to include various feature types
+            include_optional: Include degree, charge, aromaticity, etc.
+            include_numeric: Include scaled numeric features
+            include_gasteiger: Compute Gasteiger partial charges
         """
-        self.atom_types = atom_types
-        self.hybridization_types = hybridization_types
-        self.include_degree = include_degree
-        self.include_charge = include_charge
-        self.include_aromatic = include_aromatic
-        self.include_hybridization = include_hybridization
-        self.include_valence = include_valence
-        self.include_ring = include_ring
-        self.include_num_hs = include_num_hs
+        self.include_optional = include_optional
         self.include_numeric = include_numeric
         self.include_gasteiger = include_gasteiger
     
-    def get_atom_type(self, atom) -> List[float]:
-        """One-hot encoding of atom type."""
-        return one_hot_encoding(atom.GetSymbol(), self.atom_types)
-    
-    def get_hybridization(self, atom) -> List[float]:
-        """One-hot encoding of hybridization."""
-        hyb = str(atom.GetHybridization()).replace('.', '').upper()
-        return one_hot_encoding(hyb, self.hybridization_types)
-    
-    def get_degree(self, atom) -> List[float]:
-        """Atom degree (number of bonds)."""
-        return [float(atom.GetDegree())]
-    
-    def get_formal_charge(self, atom) -> List[float]:
-        """Formal charge."""
-        return [float(atom.GetFormalCharge())]
-    
-    def get_is_aromatic(self, atom) -> List[float]:
-        """Whether atom is aromatic."""
-        return [1.0 if atom.GetIsAromatic() else 0.0]
-    
-    def get_is_in_ring(self, atom) -> List[float]:
-        """Whether atom is in a ring."""
-        return [1.0 if atom.IsInRing() else 0.0]
-    
-    def get_num_hs(self, atom) -> List[float]:
-        """Number of hydrogens (including implicit)."""
-        return [float(atom.GetTotalNumHs())]
-    
-    def get_valence(self, atom) -> List[float]:
-        """Implicit valence."""
-        return [float(atom.GetImplicitValence())]
-    
-    def get_numeric_features(
-        self, 
-        atom, 
-        gasteiger_charge: Optional[float] = None
-    ) -> List[float]:
-        """
-        Scaled numeric features.
+    def compute_gasteiger_charges(self, mol) -> np.ndarray:
+        """Compute Gasteiger partial charges for all atoms."""
+        import rdkit.Chem.rdPartialCharges as rdPartialCharges
         
-        Returns normalized:
-        - Atomic number / 100
-        - Atomic mass / 200
-        - Electronegativity / 4
-        - Gasteiger charge
-        """
-        atomic_num = float(atom.GetAtomicNum()) / 100.0
-        atom_mass = float(atom.GetMass()) / 200.0
+        if not self.include_gasteiger:
+            return np.zeros((mol.GetNumAtoms(),), dtype=float)
         
-        symbol = atom.GetSymbol()
-        elneg = PAULING_ELECTRONEGATIVITY.get(symbol, DEFAULT_ELECTRONEGATIVITY) / 4.0
-        
-        g_charge = float(gasteiger_charge) if gasteiger_charge is not None else 0.0
-        
-        return [atomic_num, atom_mass, elneg, g_charge]
+        try:
+            rdPartialCharges.ComputeGasteigerCharges(mol)
+            charges = []
+            for atom in mol.GetAtoms():
+                if atom.HasProp('_GasteigerCharge'):
+                    try:
+                        charges.append(float(atom.GetProp('_GasteigerCharge')))
+                    except (ValueError, TypeError):
+                        charges.append(0.0)
+                else:
+                    charges.append(0.0)
+            return np.array(charges, dtype=float)
+        except Exception:
+            return np.zeros((mol.GetNumAtoms(),), dtype=float)
     
     def featurize_atom(
         self,
         atom,
-        gasteiger_charge: Optional[float] = None,
+        gasteiger_charge: float = 0.0
     ) -> List[float]:
         """
-        Compute all features for a single atom.
+        Compute features for a single atom.
         
         Args:
-            atom: RDKit atom object
-            gasteiger_charge: Pre-computed Gasteiger charge
+            atom: RDKit Atom object
+            gasteiger_charge: Precomputed Gasteiger charge
             
         Returns:
-            List of features
+            List of float features
         """
-        features = []
+        feats = []
         
-        # Base features (atom type)
-        features.extend(self.get_atom_type(atom))
+        # Atom type (one-hot)
+        feats.extend(one_of_k_encoding_unk(
+            atom.GetSymbol(), DEFAULT_ATOM_TYPE_SET
+        ))
         
-        # Optional features
-        if self.include_degree:
-            features.extend(self.get_degree(atom))
-        
-        if self.include_charge:
-            features.extend(self.get_formal_charge(atom))
-        
-        if self.include_aromatic:
-            features.extend(self.get_is_aromatic(atom))
-        
-        if self.include_hybridization:
-            features.extend(self.get_hybridization(atom))
-        
-        if self.include_valence:
-            features.extend(self.get_valence(atom))
-        
-        if self.include_ring:
-            features.extend(self.get_is_in_ring(atom))
-        
-        if self.include_num_hs:
-            features.extend(self.get_num_hs(atom))
+        if self.include_optional:
+            # Degree
+            feats.append(float(atom.GetDegree()))
+            # Formal charge
+            feats.append(float(atom.GetFormalCharge()))
+            # Aromaticity
+            feats.append(1.0 if atom.GetIsAromatic() else 0.0)
+            # Hybridization (one-hot)
+            hyb = str(atom.GetHybridization()).replace('.', '').upper()
+            feats.extend(one_of_k_encoding_unk(hyb, DEFAULT_HYBRIDIZATION_SET))
+            # Implicit valence
+            feats.append(float(atom.GetImplicitValence()))
+            # Ring membership
+            feats.append(1.0 if atom.IsInRing() else 0.0)
+            # Number of hydrogens
+            feats.append(float(atom.GetTotalNumHs()))
         
         if self.include_numeric:
-            features.extend(self.get_numeric_features(atom, gasteiger_charge))
+            # Scaled atomic number
+            feats.append(float(atom.GetAtomicNum()) / 100.0)
+            # Scaled atomic mass
+            feats.append(float(atom.GetMass()) / 200.0)
+            # Scaled electronegativity
+            en = PAULING_ELECTRONEGATIVITY.get(
+                atom.GetSymbol(), DEFAULT_ELECTRONEGATIVITY
+            )
+            feats.append(float(en) / 4.0)
+            # Gasteiger charge
+            feats.append(float(gasteiger_charge))
         
-        return features
+        return feats
     
-    def get_feature_dim(self) -> int:
-        """Get the total dimension of atom features."""
-        dim = len(self.atom_types)  # Base atom type
+    @property
+    def feature_dim(self) -> int:
+        """Get the dimension of atom feature vector."""
+        from rdkit import Chem
         
-        if self.include_degree:
-            dim += 1
-        if self.include_charge:
-            dim += 1
-        if self.include_aromatic:
-            dim += 1
-        if self.include_hybridization:
-            dim += len(self.hybridization_types)
-        if self.include_valence:
-            dim += 1
-        if self.include_ring:
-            dim += 1
-        if self.include_num_hs:
-            dim += 1
-        if self.include_numeric:
-            dim += 4  # atomic_num, mass, elneg, gasteiger
-        
-        return dim
+        # Use a dummy atom to compute feature dimension
+        mol = Chem.MolFromSmiles("C")
+        atom = mol.GetAtomWithIdx(0)
+        return len(self.featurize_atom(atom, 0.0))
 
-
-# =============================================================================
-# Gasteiger charge computation
-# =============================================================================
-
-def compute_gasteiger_charges(mol) -> np.ndarray:
-    """
-    Compute Gasteiger partial charges for all atoms.
-    
-    Args:
-        mol: RDKit molecule object
-        
-    Returns:
-        Array of charges, shape (num_atoms,)
-    """
-    try:
-        import rdkit.Chem.rdPartialCharges as rdPartialCharges
-    except ImportError:
-        raise ImportError("RDKit not installed")
-    
-    num_atoms = mol.GetNumAtoms()
-    
-    try:
-        rdPartialCharges.ComputeGasteigerCharges(mol)
-        charges = []
-        for atom in mol.GetAtoms():
-            if atom.HasProp('_GasteigerCharge'):
-                c = atom.GetProp('_GasteigerCharge')
-                try:
-                    charges.append(float(c))
-                except (ValueError, TypeError):
-                    charges.append(0.0)
-            else:
-                charges.append(0.0)
-        return np.array(charges, dtype=np.float32)
-    except Exception:
-        return np.zeros(num_atoms, dtype=np.float32)
-
-
-# =============================================================================
-# Edge extraction
-# =============================================================================
-
-def get_edge_index(mol) -> np.ndarray:
-    """
-    Extract edge index from molecule (COO format).
-    
-    Creates undirected edges (both directions for each bond).
-    
-    Args:
-        mol: RDKit molecule object
-        
-    Returns:
-        Edge index array of shape (2, num_edges)
-    """
-    edges = []
-    for bond in mol.GetBonds():
-        i = bond.GetBeginAtomIdx()
-        j = bond.GetEndAtomIdx()
-        # Add both directions for undirected graph
-        edges.append([i, j])
-        edges.append([j, i])
-    
-    if not edges:
-        return np.empty((2, 0), dtype=np.int64)
-    
-    edges_arr = np.array(edges, dtype=np.int64).T
-    
-    # Sort by source, then destination for consistency
-    sort_idx = np.lexsort((edges_arr[1], edges_arr[0]))
-    return edges_arr[:, sort_idx]
-
-
-# =============================================================================
-# Main GraphFeaturizer class
-# =============================================================================
 
 class GraphFeaturizer:
     """
-    Convert molecules to PyTorch Geometric graph objects.
+    Create PyTorch Geometric Data objects with SEAL-style features.
     
-    Creates graphs with:
-    - Node features (atom features)
-    - Edge index (molecular bonds)
-    - Cluster assignment matrices (S, S_node)
-    - Inter-fragment edge masks
-    - Fragment metadata (optional)
+    Each graph contains:
+    - x: Node features [num_atoms, feature_dim]
+    - edge_index: Edge indices [2, num_edges]
+    - s: Fragment membership matrix [num_atoms, num_fragments]
+    - s_node: Atom identity matrix [num_atoms, num_atoms]
+    - mask: Edge mask for broken bonds [num_edges]
+    - y: Target value [1]
+    - Fragment metadata for interpretability
     """
     
     def __init__(
         self,
-        y_column: str = "Y",
-        smiles_col: str = "canonical_smiles",
+        y_column: str = 'Y',
+        smiles_col: str = 'canonical_smiles',
         include_optional: bool = True,
         include_numeric: bool = True,
         include_gasteiger: bool = True,
-        store_fragments: bool = True,
+        store_fragments: bool = True
     ):
         """
         Initialize graph featurizer.
         
         Args:
-            y_column: Name of target column
-            smiles_col: Name of SMILES column
+            y_column: Column name for target values
+            smiles_col: Column name for SMILES
             include_optional: Include optional atom features
-            include_numeric: Include numeric atom features
+            include_numeric: Include scaled numeric features
             include_gasteiger: Include Gasteiger charges
             store_fragments: Store fragment metadata in graphs
         """
@@ -344,112 +207,155 @@ class GraphFeaturizer:
         self.smiles_col = smiles_col
         self.store_fragments = store_fragments
         
-        # Initialize atom featurizer
         self.atom_featurizer = AtomFeaturizer(
-            include_degree=include_optional,
-            include_charge=include_optional,
-            include_aromatic=include_optional,
-            include_hybridization=include_optional,
-            include_valence=include_optional,
-            include_ring=include_optional,
-            include_num_hs=include_optional,
+            include_optional=include_optional,
             include_numeric=include_numeric,
-            include_gasteiger=include_gasteiger,
+            include_gasteiger=include_gasteiger
         )
-        
         self.fragment_extractor = FragmentExtractor()
+    
+    def _create_fragment_matrix(
+        self,
+        cliques: List[List[int]],
+        num_atoms: int
+    ) -> torch.Tensor:
+        """Create fragment membership matrix S."""
+        s = torch.zeros((num_atoms, len(cliques)), dtype=torch.float32)
+        for clique_idx, clique in enumerate(cliques):
+            for atom_idx in clique:
+                s[atom_idx, clique_idx] = 1.0
+        return s
+    
+    def _create_edge_mask(
+        self,
+        edge_index: torch.Tensor,
+        breaks: List[List[int]]
+    ) -> torch.Tensor:
+        """Create mask for edges (0 for broken bonds, 1 otherwise)."""
+        if edge_index.numel() == 0:
+            return torch.empty((0,), dtype=torch.float32)
+        
+        num_edges = edge_index.size(1)
+        mask = torch.ones(num_edges, dtype=torch.float32)
+        
+        broken_edges = {frozenset(b) for b in breaks}
+        for i in range(num_edges):
+            edge = frozenset([
+                edge_index[0, i].item(),
+                edge_index[1, i].item()
+            ])
+            if edge in broken_edges:
+                mask[i] = 0.0
+        
+        return mask
+    
+    def _extract_fragment_metadata(
+        self,
+        mol,
+        cliques: List[List[int]]
+    ) -> Dict[str, List]:
+        """Extract fragment information for interpretability."""
+        metadata = {
+            'fragment_smiles': [],
+            'fragment_atom_lists': [],
+            'fragment_sizes': [],
+            'fragment_fingerprints': []
+        }
+        
+        for clique in cliques:
+            frag_smiles = self.fragment_extractor.extract_fragment_smiles(mol, clique)
+            metadata['fragment_smiles'].append(frag_smiles)
+            metadata['fragment_atom_lists'].append(clique)
+            metadata['fragment_sizes'].append(len(clique))
+            
+            if frag_smiles:
+                fp = self.fragment_extractor.compute_fragment_fingerprint(frag_smiles)
+                metadata['fragment_fingerprints'].append(fp)
+            else:
+                metadata['fragment_fingerprints'].append(None)
+        
+        return metadata
     
     def featurize_molecule(
         self,
         smiles: str,
-        y_value: float,
-        y_mean: float = 0.0,
-        y_std: float = 1.0,
-        drug_id: Optional[str] = None,
-    ):
+        y: float,
+        mean: float = 0.0,
+        std: float = 1.0,
+        drug_id: Any = None
+    ) -> Optional[Data]:
         """
-        Convert a single molecule to a graph.
+        Create a PyG Data object from a single molecule.
         
         Args:
             smiles: SMILES string
-            y_value: Target value
-            y_mean: Mean for normalization
-            y_std: Std for normalization
-            drug_id: Optional molecule identifier
+            y: Target value
+            mean: Mean for target normalization
+            std: Std for target normalization
+            drug_id: Optional identifier
             
         Returns:
-            PyTorch Geometric Data object, or None if featurization fails
+            PyG Data object or None if featurization fails
         """
-        try:
-            from rdkit import Chem
-            import torch
-            from torch_geometric.data import Data
-        except ImportError as e:
-            raise ImportError(f"Required library not installed: {e}")
+        from rdkit import Chem
         
-        # Parse molecule
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
-            logger.warning(f"Failed to parse SMILES: {smiles[:50]}...")
             return None
         
         # Normalize target
-        y_norm = (y_value - y_mean) / y_std if y_std != 0 else y_value
+        y_norm = (float(y) - mean) / std if std != 0 else float(y) - mean
         
         # Compute Gasteiger charges
-        g_charges = compute_gasteiger_charges(mol)
+        g_charges = self.atom_featurizer.compute_gasteiger_charges(mol)
         
-        # Extract edges
-        edge_index = get_edge_index(mol)
-        edge_index = torch.LongTensor(edge_index)
+        # Build edge index
+        edges = []
+        for bond in mol.GetBonds():
+            start = bond.GetBeginAtomIdx()
+            end = bond.GetEndAtomIdx()
+            edges.append((start, end))
+            edges.append((end, start))
         
-        # Compute atom features
+        if edges:
+            edge_index = torch.LongTensor(np.array(edges).T)
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+        
+        # Build node features
         nodes = []
         for i, atom in enumerate(mol.GetAtoms()):
             gc = g_charges[i] if i < len(g_charges) else 0.0
-            features = self.atom_featurizer.featurize_atom(atom, gasteiger_charge=gc)
-            nodes.append(features)
+            feats = self.atom_featurizer.featurize_atom(atom, gasteiger_charge=gc)
+            nodes.append(feats)
         
         if nodes:
             x = torch.FloatTensor(np.array(nodes))
-            # Handle NaN/Inf values
             x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
         else:
-            # Empty molecule fallback
-            feat_dim = self.atom_featurizer.get_feature_dim()
-            x = torch.empty((0, feat_dim), dtype=torch.float32)
+            x = torch.empty((0, self.atom_featurizer.feature_dim), dtype=torch.float32)
         
-        # BRICS decomposition
+        # BRICS fragmentation
         num_atoms = mol.GetNumAtoms()
-        cliques, breaks = brics_decomp_extra(mol)
+        cliques, breaks = brics_decompose(mol)
         
-        if cliques is None or len(cliques) == 0:
+        if not cliques:
             cliques = [[i] for i in range(num_atoms)]
-            breaks = []
         
-        # Cluster assignment matrices
-        s = create_cluster_assignment_matrix(cliques, num_atoms)
-        s_node = create_atom_wise_assignment_matrix(cliques, num_atoms)
+        # Create fragment matrices
+        s = self._create_fragment_matrix(cliques, num_atoms)
+        s_node = torch.eye(num_atoms, dtype=torch.float32)
+        mask = self._create_edge_mask(edge_index, breaks)
         
-        s = torch.FloatTensor(s)
-        s_node = torch.FloatTensor(s_node)
-        
-        # Inter-fragment edge mask
-        if edge_index.numel() != 0:
-            mask = mask_broken_edges(edge_index.numpy(), breaks)
-            mask = torch.FloatTensor(mask)
-        else:
-            mask = torch.empty((0,), dtype=torch.float32)
-        
-        # Create graph data object
+        # Create Data object
         data = Data(
             x=x,
             edge_index=edge_index,
             s=s,
             s_node=s_node,
-            y=torch.FloatTensor([float(y_norm)]),
-            num_cluster=torch.LongTensor([int(s.shape[1])]),
-            mask=mask,
+            y=torch.FloatTensor([y_norm]),
+            num_cluster=torch.LongTensor([s.shape[1]]),
+            mask=mask
         )
         
         # Store metadata
@@ -458,92 +364,77 @@ class GraphFeaturizer:
         
         # Store fragment information
         if self.store_fragments:
-            fragment_meta = extract_fragment_metadata(mol, cliques)
+            fragment_meta = self._extract_fragment_metadata(mol, cliques)
             data.fragment_smiles = fragment_meta['fragment_smiles']
             data.fragment_atom_lists = fragment_meta['fragment_atom_lists']
             data.fragment_sizes = fragment_meta['fragment_sizes']
-            if 'fragment_fingerprints' in fragment_meta:
-                data.fragment_fingerprints = fragment_meta['fragment_fingerprints']
+            data.fragment_fingerprints = fragment_meta['fragment_fingerprints']
         
         return data
     
     def __call__(
         self,
         df: pd.DataFrame,
-        stats: Dict[str, float],
-    ) -> List:
+        stats: Dict[str, float] = None
+    ) -> List[Data]:
         """
         Featurize all molecules in a DataFrame.
         
         Args:
-            df: DataFrame with molecules
-            stats: Dictionary with "mean" and "std" for normalization
+            df: DataFrame with SMILES and targets
+            stats: Dict with 'mean' and 'std' for normalization
             
         Returns:
-            List of PyTorch Geometric Data objects
+            List of PyG Data objects
         """
-        import torch
+        if stats is None:
+            stats = {}
         
         mean = stats.get("mean", 0.0)
         std = stats.get("std", 1.0)
-        if std == 0:
-            std = 1.0
         
         graphs = []
-        failed = 0
+        n_failed = 0
         
         for idx, row in df.iterrows():
-            smiles = row.get(self.smiles_col)
-            y_val = row.get(self.y_column, 0.0)
-            drug_id = row.get("Drug_ID")
-            
-            if pd.isna(smiles):
-                failed += 1
+            try:
+                y = float(row[self.y_column])
+            except (ValueError, TypeError):
+                n_failed += 1
                 continue
             
-            try:
-                y_val = float(y_val) if not pd.isna(y_val) else 0.0
-            except (ValueError, TypeError):
-                y_val = 0.0
+            smiles = row.get(self.smiles_col)
+            if pd.isna(smiles):
+                n_failed += 1
+                continue
             
             data = self.featurize_molecule(
                 smiles=smiles,
-                y_value=y_val,
-                y_mean=mean,
-                y_std=std,
-                drug_id=drug_id,
+                y=y,
+                mean=mean,
+                std=std,
+                drug_id=row.get("Drug_ID")
             )
             
             if data is not None:
                 graphs.append(data)
             else:
-                failed += 1
+                n_failed += 1
         
-        if failed > 0:
-            logger.warning(f"Failed to featurize {failed}/{len(df)} molecules")
+        logger.info(f"Created {len(graphs)} graphs, {n_failed} failed")
         
-        # Pad cluster matrices to same size for batching
+        # Pad fragment matrices to consistent size
         if graphs:
-            graphs = self._pad_cluster_matrices(graphs)
+            graphs = self._pad_fragment_matrices(graphs)
         
         return graphs
     
-    def _pad_cluster_matrices(self, graphs: List) -> List:
-        """
-        Pad cluster assignment matrices to consistent sizes.
-        
-        Required for batching graphs with different numbers of clusters.
-        """
-        import torch
-        
-        if not graphs:
-            return graphs
-        
+    def _pad_fragment_matrices(self, graphs: List[Data]) -> List[Data]:
+        """Pad S matrices to maximum cluster count across batch."""
         max_clusters = max(d.s.size(1) for d in graphs)
         max_nodes = max(d.s_node.size(1) for d in graphs)
         
         for d in graphs:
-            # Pad S matrix
             if d.s.size(1) < max_clusters:
                 pad = torch.zeros(
                     (d.s.size(0), max_clusters - d.s.size(1)),
@@ -551,7 +442,6 @@ class GraphFeaturizer:
                 )
                 d.s = torch.cat([d.s, pad], dim=1)
             
-            # Pad S_node matrix
             if d.s_node.size(1) < max_nodes:
                 pad = torch.zeros(
                     (d.s_node.size(0), max_nodes - d.s_node.size(1)),
@@ -562,71 +452,52 @@ class GraphFeaturizer:
         return graphs
 
 
-# =============================================================================
-# Batch processing utilities
-# =============================================================================
-
-def featurize_dataset(
-    df: pd.DataFrame,
+def save_graphs(
+    graphs: List[Data],
     output_dir: Path,
-    task_name: str,
-    y_column: str = "Y",
-    smiles_col: str = "canonical_smiles",
-    compute_stats_from: Optional[pd.DataFrame] = None,
-    store_fragments: bool = True,
-) -> Dict:
+    prefix: str = "graph"
+) -> List[Path]:
     """
-    Featurize a dataset and save graphs to disk.
+    Save graphs to individual .pt files.
     
     Args:
-        df: DataFrame with molecules
-        output_dir: Directory to save graph files
-        task_name: Name of the task/dataset
-        y_column: Name of target column
-        smiles_col: Name of SMILES column
-        compute_stats_from: DataFrame to compute normalization stats from
-        store_fragments: Whether to store fragment metadata
+        graphs: List of PyG Data objects
+        output_dir: Output directory
+        prefix: Filename prefix
         
     Returns:
-        Dictionary with processing statistics
+        List of saved file paths
     """
-    import torch
-    
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Compute normalization statistics
-    stats_df = compute_stats_from if compute_stats_from is not None else df
-    mean = float(stats_df[y_column].mean())
-    std = float(stats_df[y_column].std())
-    if std == 0:
-        std = 1.0
+    paths = []
+    for i, g in enumerate(graphs):
+        path = output_dir / f"{prefix}_{i:05d}.pt"
+        torch.save(g, path)
+        paths.append(path)
     
-    stats = {"mean": mean, "std": std}
+    logger.info(f"Saved {len(paths)} graphs to {output_dir}")
+    return paths
+
+
+def load_graphs(input_dir: Path, pattern: str = "*.pt") -> List[Data]:
+    """
+    Load graphs from .pt files.
     
-    # Initialize featurizer
-    featurizer = GraphFeaturizer(
-        y_column=y_column,
-        smiles_col=smiles_col,
-        include_optional=True,
-        include_numeric=True,
-        include_gasteiger=True,
-        store_fragments=store_fragments,
-    )
+    Args:
+        input_dir: Directory containing .pt files
+        pattern: Glob pattern for files
+        
+    Returns:
+        List of PyG Data objects
+    """
+    input_dir = Path(input_dir)
+    paths = sorted(input_dir.glob(pattern))
     
-    # Featurize all molecules
-    graphs = featurizer(df, stats)
+    graphs = []
+    for path in paths:
+        graphs.append(torch.load(path))
     
-    # Save individual graph files
-    for i, graph in enumerate(graphs):
-        filename = output_dir / f"{task_name}_{i:06d}.pt"
-        torch.save(graph, filename)
-    
-    logger.info(f"Saved {len(graphs)} graphs to {output_dir}")
-    
-    return {
-        "n_graphs": len(graphs),
-        "mean": mean,
-        "std": std,
-        "output_dir": str(output_dir),
-    }
+    logger.info(f"Loaded {len(graphs)} graphs from {input_dir}")
+    return graphs
