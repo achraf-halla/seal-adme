@@ -19,7 +19,7 @@ from torch.optim import Adam
 from torch_geometric.loader import DataLoader
 from sklearn.metrics import roc_auc_score, average_precision_score
 
-from .datasets import PretrainDataset, BalancedMultiTaskSampler
+from .datasets import PretrainDataset, BalancedMultiTaskSampler, collate_with_padding
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ class PretrainTrainer:
             return np.array([]), np.array([])
         
         graphs = [dataset.load_graph(i) for i in indices]
-        loader = DataLoader(graphs, batch_size=batch_size, shuffle=False)
+        loader = DataLoader(graphs, batch_size=batch_size, shuffle=False, collate_fn=collate_with_padding)
         
         preds_list, trues_list = [], []
         with torch.no_grad():
@@ -184,7 +184,7 @@ class PretrainTrainer:
                 batch_loss = 0.0
                 
                 for task_name, task_graphs in task_batches.items():
-                    loader = DataLoader(task_graphs, batch_size=len(task_graphs), shuffle=False)
+                    loader = DataLoader(task_graphs, batch_size=len(task_graphs), shuffle=False, collate_fn=collate_with_padding)
                     batch = next(iter(loader)).to(self.device)
                     
                     out = self.model(batch, task_name)

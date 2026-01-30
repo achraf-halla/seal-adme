@@ -23,7 +23,7 @@ from torch_geometric.data import Data
 from sklearn.metrics import mean_squared_error
 from scipy.stats import spearmanr, pearsonr
 
-from .datasets import create_data_loaders
+from .datasets import create_data_loaders, collate_with_padding
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +99,7 @@ class FinetuneTrainer:
         if len(graphs) == 0:
             return np.array([]), np.array([])
         
-        loader = DataLoader(graphs, batch_size=batch_size, shuffle=False)
+        loader = DataLoader(graphs, batch_size=batch_size, shuffle=False, collate_fn=collate_with_padding)
         preds_list, trues_list = [], []
         
         with torch.no_grad():
@@ -198,7 +198,8 @@ class FinetuneTrainer:
                 batch_size=batch_size,
                 shuffle=True,
                 num_workers=num_workers,
-                pin_memory=torch.cuda.is_available()
+                pin_memory=torch.cuda.is_available(),
+                collate_fn=collate_with_padding
             )
             task_loaders[task_name] = loader
             task_iters[task_name] = iter(loader)
