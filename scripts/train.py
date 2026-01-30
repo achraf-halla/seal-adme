@@ -63,16 +63,51 @@ def load_config(config_path):
         return yaml.safe_load(f)
 
 
-def load_pretrain_datasets(graph_dir, metadata_dir):
-    """Load pretraining datasets from metadata parquet files."""
+def load_pretrain_datasets(graph_dir, split_dir=None):
+    """Load pretraining datasets from graph directory.
+    
+    Supports two modes:
+    1. Task-organized: graph_dir contains task subdirectories with graphs
+    2. Metadata-based: Uses parquet files from split_dir
+    """
     logger = logging.getLogger("load_pretrain")
     
     graph_dir = Path(graph_dir)
-    metadata_dir = Path(metadata_dir)
     
-    # Load train metadata
-    train_meta_path = metadata_dir / "pretrain_train.parquet"
-    valid_meta_path = metadata_dir / "pretrain_valid.parquet"
+    # Check for task subdirectories
+    task_dirs = [d for d in graph_dir.iterdir() if d.is_dir()]
+    
+    if task_dirs:
+        # Task-organized structure - load directly from graph directory
+        logger.info(f"Loading from task-organized directory: {graph_dir}")
+        
+        # Create dataset that scans directory
+        train_dataset = PretrainDataset(graph_dir, metadata_df=None)
+        
+        # For validation, we need to filter by split
+        # Create a separate dataset instance for valid data
+        valid_dataset = PretrainDataset(graph_dir, metadata_df=None)
+        
+        # Filter to only include 'valid' split indices
+        train_indices = []
+        valid_indices = []
+        
+        for task in train_dataset.task_names:
+            train_indices.extend(train_dataset.get_task_indices(task, 'train'))
+            valid_indices.extend(train_dataset.get_task_indices(task, 'valid'))
+        
+        logger.info(f"Loaded pretrain datasets: train={len(train_indices)}, valid={len(valid_indices)}")
+        
+        return train_dataset, valid_dataset
+    
+    # Fallback: metadata-based loading
+    if split_dir is None:
+        raise ValueError("No task directories found and no split_dir provided")
+    
+    split_dir = Path(split_dir)
+    
+    train_meta_path = split_dir / "pretrain_train.parquet"
+    valid_meta_path = split_dir / "pretrain_valid.parquet"
     
     if not train_meta_path.exists():
         raise FileNotFoundError(f"Train metadata not found: {train_meta_path}")
@@ -80,17 +115,12 @@ def load_pretrain_datasets(graph_dir, metadata_dir):
     train_meta = pd.read_parquet(train_meta_path)
     valid_meta = pd.read_parquet(valid_meta_path) if valid_meta_path.exists() else train_meta.iloc[:0]
     
-    # Add graph_id column if not present
-    if 'graph_id' not in train_meta.columns:
-        train_meta['graph_id'] = train_meta.index
-    if 'graph_id' not in valid_meta.columns:
-        valid_meta['graph_id'] = valid_meta.index
-    
-    # Add label column
-    if 'label' not in train_meta.columns:
-        train_meta['label'] = train_meta['Y']
-    if 'label' not in valid_meta.columns:
-        valid_meta['label'] = valid_meta['Y']
+    # Add required columns
+    for df in [train_meta, valid_meta]:
+        if 'graph_id' not in df.columns:
+            df['graph_id'] = df.index
+        if 'label' not in df.columns:
+            df['label'] = df['Y']
     
     train_dataset = PretrainDataset(graph_dir, train_meta)
     valid_dataset = PretrainDataset(graph_dir, valid_meta)
@@ -162,10 +192,10 @@ def run_pretrain(config, args):
     pretrain_config = config.get("pretrain", {})
     data_config = config.get("data", {})
     
-    graph_dir = Path(data_config.get("graph_dir", "data/graphs/pretrain_train"))
-    metadata_dir = Path(data_config.get("split_dir", "data/splits"))
+    graph_dir = Path(data_config.get("graph_dir", "data/graphs"))
+    split_dir = Path(data_config.get("split_dir", "data/splits"))
     
-    train_dataset, valid_dataset = load_pretrain_datasets(graph_dir, metadata_dir)
+    train_dataset, valid_dataset = load_pretrain_datasets(graph_dir, split_dir)
     
     # Build model
     model_config = config.get("model", {})
