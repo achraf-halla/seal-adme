@@ -22,22 +22,28 @@ class PretrainDataset:
     """
     Dataset for multi-task pretraining from graph files.
     
-    Loads graphs from disk organized by task directories.
-    Supports two directory structures:
-    1. Flat: graph_dir/{graph_id}.pt with metadata DataFrame
-    2. Task-organized: graph_dir/{task_name}/features_{task}_{split}_{idx}.pt
+    Supports directory structures:
+    1. Task-organized: graph_dir/{task_name}/features_{task}_{split}_{idx}.pt
+    2. Split-organized: graph_dir/{split}/features_{task}_{split}_{idx}.pt  
+    3. Flat with metadata: graph_dir/{graph_id}.pt + metadata DataFrame
     
     Args:
-        graph_dir: Directory containing graph files (or task subdirectories)
-        metadata_df: Optional DataFrame with columns: task_name, label, split
-                    If None, will scan directory structure
+        graph_dir: Directory containing graph files
+        metadata_df: Optional DataFrame with task/label info
+        task_filter: Optional list of task names to include (e.g., pretrain tasks only)
     """
     
-    def __init__(self, graph_dir: Path, metadata_df: pd.DataFrame = None):
+    def __init__(
+        self, 
+        graph_dir: Path, 
+        metadata_df: pd.DataFrame = None,
+        task_filter: List[str] = None
+    ):
         self.graph_dir = Path(graph_dir)
+        self.task_filter = task_filter
         
-        # Storage for loaded graphs organized by (task, split)
-        self.graphs = {}  # (task_name, split) -> list of (graph, label)
+        # Storage for loaded graphs: (task_name, split) -> list of (graph, label)
+        self.graphs = {}
         self.task_to_indices = defaultdict(list)
         self.task_to_labels = defaultdict(list)
         
@@ -45,11 +51,9 @@ class PretrainDataset:
         self.index_map = []
         
         if metadata_df is not None and 'graph_id' in metadata_df.columns:
-            # Use metadata-based loading (flat structure)
             self._load_from_metadata(metadata_df)
         else:
-            # Scan directory structure
-            self._load_from_directory(metadata_df)
+            self._load_from_directory()
         
         self.task_names = list(self.task_to_indices.keys())
         
@@ -59,12 +63,52 @@ class PretrainDataset:
             n_pos = sum(self.task_to_labels[task])
             logger.info(f"  {task}: {n_samples} samples ({n_pos} positive)")
     
+    def _parse_filename(self, filename: str) -> tuple:
+        """
+        Parse task name and split from filename.
+        
+        Expected patterns:
+        - features_{task}_{split}_{idx}.pt
+        - {task}_{split}_{idx}.pt
+        - graph_{task}_{split}_{idx}.pt
+        
+        Returns: (task_name, split) or (None, None) if unparseable
+        """
+        stem = Path(filename).stem
+        parts = stem.split('_')
+        
+        # Handle various prefixes
+        if parts[0] in ('features', 'graph'):
+            parts = parts[1:]
+        
+        if len(parts) < 3:
+            return None, None
+        
+        # Last part is index, second-to-last is split
+        split = parts[-2]
+        if split not in ('train', 'valid', 'test'):
+            # Try finding split elsewhere
+            for i, p in enumerate(parts):
+                if p in ('train', 'valid', 'test'):
+                    split = p
+                    task_name = '_'.join(parts[:i])
+                    return task_name, split
+            return None, None
+        
+        # Task name is everything before split
+        task_name = '_'.join(parts[:-2])
+        return task_name, split
+    
     def _load_from_metadata(self, metadata_df: pd.DataFrame):
-        """Load graphs using metadata DataFrame (flat structure)."""
+        """Load using metadata DataFrame."""
         self.metadata = metadata_df
         
         for idx, row in metadata_df.iterrows():
             task = row['task_name']
+            
+            if self.task_filter and task not in self.task_filter:
+                continue
+            
             split = row.get('split', 'train')
             label = row.get('label', row.get('Y', 0))
             
@@ -72,40 +116,36 @@ class PretrainDataset:
             self.task_to_labels[task].append(label)
             self.index_map.append((task, split, idx, row.get('graph_id', idx)))
     
-    def _load_from_directory(self, metadata_df: pd.DataFrame = None):
-        """Load graphs by scanning task directories."""
-        # Check if graph_dir contains task subdirectories or is flat
+    def _load_from_directory(self):
+        """Load by scanning directory structure."""
         subdirs = [d for d in self.graph_dir.iterdir() if d.is_dir()]
         
         if subdirs:
-            # Task-organized structure: graph_dir/{task}/{files}
-            for task_dir in sorted(subdirs):
-                task_name = task_dir.name
-                self._load_task_graphs(task_dir, task_name, metadata_df)
+            for subdir in sorted(subdirs):
+                self._load_graphs_from_folder(subdir)
         else:
-            # Flat structure with metadata
-            if metadata_df is not None:
-                self._load_from_metadata(metadata_df)
-            else:
-                # Try to load all .pt files as a single task
-                self._load_flat_graphs()
+            self._load_graphs_from_folder(self.graph_dir)
     
-    def _load_task_graphs(self, task_dir: Path, task_name: str, metadata_df: pd.DataFrame = None):
-        """Load all graphs from a task directory."""
-        # Find all graph files
-        graph_files = sorted(task_dir.glob("*.pt"))
+    def _load_graphs_from_folder(self, folder: Path):
+        """Load all .pt files from a folder, parsing task/split from filenames."""
+        graph_files = sorted(folder.glob("*.pt"))
         
         for graph_path in graph_files:
             try:
-                # Parse filename to get split: features_{task}_{split}_{idx}.pt
-                parts = graph_path.stem.split('_')
-                if len(parts) >= 3:
-                    split = parts[-2]  # e.g., 'train', 'valid', 'test'
-                else:
-                    split = 'train'
+                # Parse filename
+                task_name, split = self._parse_filename(graph_path.name)
                 
-                # Load graph
-                graph = torch.load(graph_path, weights_only=False)
+                # If can't parse from filename, try to get from graph
+                if task_name is None:
+                    graph = torch.load(graph_path, weights_only=False)
+                    task_name = getattr(graph, 'task_name', folder.name)
+                    split = 'train'
+                else:
+                    graph = torch.load(graph_path, weights_only=False)
+                
+                # Apply task filter
+                if self.task_filter and task_name not in self.task_filter:
+                    continue
                 
                 # Get label
                 if hasattr(graph, 'y') and graph.y is not None:
@@ -130,44 +170,15 @@ class PretrainDataset:
             except Exception as e:
                 logger.warning(f"Failed to load {graph_path}: {e}")
     
-    def _load_flat_graphs(self):
-        """Load graphs from flat directory structure."""
-        graph_files = sorted(self.graph_dir.glob("*.pt"))
-        
-        for idx, graph_path in enumerate(graph_files):
-            try:
-                graph = torch.load(graph_path, weights_only=False)
-                
-                task_name = getattr(graph, 'task_name', 'default')
-                split = 'train'
-                label = float(graph.y.item()) if hasattr(graph, 'y') and graph.y is not None else 0.0
-                
-                key = (task_name, split)
-                if key not in self.graphs:
-                    self.graphs[key] = []
-                
-                local_idx = len(self.graphs[key])
-                self.graphs[key].append((graph, label))
-                
-                global_idx = len(self.index_map)
-                self.task_to_indices[task_name].append(global_idx)
-                self.task_to_labels[task_name].append(label)
-                self.index_map.append((task_name, split, local_idx, str(graph_path)))
-                
-            except Exception as e:
-                logger.warning(f"Failed to load {graph_path}: {e}")
-    
     def load_graph(self, idx: int) -> Data:
         """Load a single graph by global index."""
         task_name, split, local_idx, path_or_id = self.index_map[idx]
         
         key = (task_name, split)
         if key in self.graphs:
-            # Already loaded in memory
             graph, label = self.graphs[key][local_idx]
             graph = graph.clone()
         else:
-            # Load from disk (metadata-based)
             if isinstance(path_or_id, str) and Path(path_or_id).exists():
                 graph_path = Path(path_or_id)
             else:
@@ -430,3 +441,95 @@ def create_data_loaders(
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available()
     )
+
+
+def pad_s_matrix(data: Data, max_fragments: int = None) -> Data:
+    """
+    Pad the fragment membership matrix (s) to consistent size.
+    
+    The 's' matrix has shape [n_atoms, n_fragments] but n_fragments varies.
+    This pads the second dimension to max_fragments.
+    
+    Args:
+        data: PyG Data object with 's' attribute
+        max_fragments: Target number of fragment columns (None = no padding)
+        
+    Returns:
+        Data object with padded 's' matrix
+    """
+    if not hasattr(data, 's') or data.s is None:
+        return data
+    
+    if max_fragments is None:
+        return data
+    
+    s = data.s
+    n_atoms, n_frags = s.shape
+    
+    if n_frags < max_fragments:
+        # Pad with zeros
+        padding = torch.zeros(n_atoms, max_fragments - n_frags, dtype=s.dtype)
+        data.s = torch.cat([s, padding], dim=1)
+    elif n_frags > max_fragments:
+        # Truncate (shouldn't happen normally)
+        data.s = s[:, :max_fragments]
+    
+    return data
+
+
+def collate_with_padding(data_list: List[Data]) -> Data:
+    """
+    Custom collate function that pads 's' matrices before batching.
+    
+    Args:
+        data_list: List of Data objects
+        
+    Returns:
+        Batched Data object
+    """
+    from torch_geometric.data import Batch
+    
+    # Find max fragments across all graphs
+    max_frags = 1
+    for data in data_list:
+        if hasattr(data, 's') and data.s is not None:
+            max_frags = max(max_frags, data.s.shape[1])
+    
+    # Pad all s matrices
+    padded_list = []
+    for data in data_list:
+        data_copy = data.clone()
+        if hasattr(data_copy, 's') and data_copy.s is not None:
+            n_atoms, n_frags = data_copy.s.shape
+            if n_frags < max_frags:
+                padding = torch.zeros(n_atoms, max_frags - n_frags, dtype=data_copy.s.dtype)
+                data_copy.s = torch.cat([data_copy.s, padding], dim=1)
+        padded_list.append(data_copy)
+    
+    return Batch.from_data_list(padded_list)
+
+
+class PaddedDataLoader(DataLoader):
+    """
+    DataLoader that pads fragment matrices for consistent batching.
+    
+    Wraps PyG DataLoader with custom collate function.
+    """
+    
+    def __init__(
+        self,
+        dataset,
+        batch_size: int = 1,
+        shuffle: bool = False,
+        **kwargs
+    ):
+        # Remove collate_fn if provided, we'll use our own
+        kwargs.pop('collate_fn', None)
+        
+        super().__init__(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            collate_fn=collate_with_padding,
+            **kwargs
+        )
