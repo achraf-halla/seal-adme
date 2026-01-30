@@ -22,25 +22,34 @@ class PretrainDataset:
     """
     Dataset for multi-task pretraining from graph files.
     
-    Loads graphs from disk and organizes by task for balanced sampling.
+    Loads graphs from disk organized by task directories.
+    Supports two directory structures:
+    1. Flat: graph_dir/{graph_id}.pt with metadata DataFrame
+    2. Task-organized: graph_dir/{task_name}/features_{task}_{split}_{idx}.pt
     
     Args:
-        graph_dir: Directory containing .pt graph files
-        metadata_df: DataFrame with columns: graph_id, task_name, label, split
+        graph_dir: Directory containing graph files (or task subdirectories)
+        metadata_df: Optional DataFrame with columns: task_name, label, split
+                    If None, will scan directory structure
     """
     
-    def __init__(self, graph_dir: Path, metadata_df: pd.DataFrame):
+    def __init__(self, graph_dir: Path, metadata_df: pd.DataFrame = None):
         self.graph_dir = Path(graph_dir)
-        self.metadata = metadata_df
         
-        # Build task indices
+        # Storage for loaded graphs organized by (task, split)
+        self.graphs = {}  # (task_name, split) -> list of (graph, label)
         self.task_to_indices = defaultdict(list)
         self.task_to_labels = defaultdict(list)
         
-        for idx, row in metadata_df.iterrows():
-            task = row['task_name']
-            self.task_to_indices[task].append(idx)
-            self.task_to_labels[task].append(row['label'])
+        # Global index mapping: idx -> (task_name, split, local_idx)
+        self.index_map = []
+        
+        if metadata_df is not None and 'graph_id' in metadata_df.columns:
+            # Use metadata-based loading (flat structure)
+            self._load_from_metadata(metadata_df)
+        else:
+            # Scan directory structure
+            self._load_from_directory(metadata_df)
         
         self.task_names = list(self.task_to_indices.keys())
         
@@ -50,22 +59,141 @@ class PretrainDataset:
             n_pos = sum(self.task_to_labels[task])
             logger.info(f"  {task}: {n_samples} samples ({n_pos} positive)")
     
+    def _load_from_metadata(self, metadata_df: pd.DataFrame):
+        """Load graphs using metadata DataFrame (flat structure)."""
+        self.metadata = metadata_df
+        
+        for idx, row in metadata_df.iterrows():
+            task = row['task_name']
+            split = row.get('split', 'train')
+            label = row.get('label', row.get('Y', 0))
+            
+            self.task_to_indices[task].append(len(self.index_map))
+            self.task_to_labels[task].append(label)
+            self.index_map.append((task, split, idx, row.get('graph_id', idx)))
+    
+    def _load_from_directory(self, metadata_df: pd.DataFrame = None):
+        """Load graphs by scanning task directories."""
+        # Check if graph_dir contains task subdirectories or is flat
+        subdirs = [d for d in self.graph_dir.iterdir() if d.is_dir()]
+        
+        if subdirs:
+            # Task-organized structure: graph_dir/{task}/{files}
+            for task_dir in sorted(subdirs):
+                task_name = task_dir.name
+                self._load_task_graphs(task_dir, task_name, metadata_df)
+        else:
+            # Flat structure with metadata
+            if metadata_df is not None:
+                self._load_from_metadata(metadata_df)
+            else:
+                # Try to load all .pt files as a single task
+                self._load_flat_graphs()
+    
+    def _load_task_graphs(self, task_dir: Path, task_name: str, metadata_df: pd.DataFrame = None):
+        """Load all graphs from a task directory."""
+        # Find all graph files
+        graph_files = sorted(task_dir.glob("*.pt"))
+        
+        for graph_path in graph_files:
+            try:
+                # Parse filename to get split: features_{task}_{split}_{idx}.pt
+                parts = graph_path.stem.split('_')
+                if len(parts) >= 3:
+                    split = parts[-2]  # e.g., 'train', 'valid', 'test'
+                else:
+                    split = 'train'
+                
+                # Load graph
+                graph = torch.load(graph_path, weights_only=False)
+                
+                # Get label
+                if hasattr(graph, 'y') and graph.y is not None:
+                    label = float(graph.y.item()) if graph.y.numel() == 1 else float(graph.y[0].item())
+                else:
+                    label = 0.0
+                
+                # Store
+                key = (task_name, split)
+                if key not in self.graphs:
+                    self.graphs[key] = []
+                
+                local_idx = len(self.graphs[key])
+                self.graphs[key].append((graph, label))
+                
+                # Update indices
+                global_idx = len(self.index_map)
+                self.task_to_indices[task_name].append(global_idx)
+                self.task_to_labels[task_name].append(label)
+                self.index_map.append((task_name, split, local_idx, str(graph_path)))
+                
+            except Exception as e:
+                logger.warning(f"Failed to load {graph_path}: {e}")
+    
+    def _load_flat_graphs(self):
+        """Load graphs from flat directory structure."""
+        graph_files = sorted(self.graph_dir.glob("*.pt"))
+        
+        for idx, graph_path in enumerate(graph_files):
+            try:
+                graph = torch.load(graph_path, weights_only=False)
+                
+                task_name = getattr(graph, 'task_name', 'default')
+                split = 'train'
+                label = float(graph.y.item()) if hasattr(graph, 'y') and graph.y is not None else 0.0
+                
+                key = (task_name, split)
+                if key not in self.graphs:
+                    self.graphs[key] = []
+                
+                local_idx = len(self.graphs[key])
+                self.graphs[key].append((graph, label))
+                
+                global_idx = len(self.index_map)
+                self.task_to_indices[task_name].append(global_idx)
+                self.task_to_labels[task_name].append(label)
+                self.index_map.append((task_name, split, local_idx, str(graph_path)))
+                
+            except Exception as e:
+                logger.warning(f"Failed to load {graph_path}: {e}")
+    
     def load_graph(self, idx: int) -> Data:
-        """Load a single graph by metadata index."""
-        row = self.metadata.iloc[idx]
-        graph_path = self.graph_dir / f"{row['graph_id']}.pt"
-        graph = torch.load(graph_path, weights_only=False)
-        graph.task_name = row['task_name']
-        graph.y = torch.FloatTensor([float(row['label'])])
+        """Load a single graph by global index."""
+        task_name, split, local_idx, path_or_id = self.index_map[idx]
+        
+        key = (task_name, split)
+        if key in self.graphs:
+            # Already loaded in memory
+            graph, label = self.graphs[key][local_idx]
+            graph = graph.clone()
+        else:
+            # Load from disk (metadata-based)
+            if isinstance(path_or_id, str) and Path(path_or_id).exists():
+                graph_path = Path(path_or_id)
+            else:
+                graph_path = self.graph_dir / f"{path_or_id}.pt"
+            
+            graph = torch.load(graph_path, weights_only=False)
+            label = self.task_to_labels[task_name][self.task_to_indices[task_name].index(idx)]
+        
+        graph.task_name = task_name
+        graph.y = torch.FloatTensor([float(label)])
         return graph
     
-    def get_task_indices(self, task_name: str, split: str) -> List[int]:
-        """Get indices for a task and split."""
-        mask = (self.metadata['task_name'] == task_name) & (self.metadata['split'] == split)
-        return self.metadata[mask].index.tolist()
+    def get_task_indices(self, task_name: str, split: str = None) -> List[int]:
+        """Get global indices for a task (optionally filtered by split)."""
+        indices = []
+        for global_idx in self.task_to_indices.get(task_name, []):
+            if split is None:
+                indices.append(global_idx)
+            else:
+                t, s, _, _ = self.index_map[global_idx]
+                if s == split:
+                    indices.append(global_idx)
+        return indices
     
     def __len__(self) -> int:
-        return len(self.metadata)
+        return len(self.index_map)
 
 
 class GraphListDataset:
@@ -98,7 +226,7 @@ class BalancedMultiTaskSampler:
     
     Args:
         dataset: PretrainDataset instance
-        split: Data split to sample from ('train', 'valid', 'test')
+        split: Data split to sample from ('train', 'valid', 'test') or None for all
         batch_size: Batch size
         samples_per_task_per_epoch: Samples per task per epoch (None = min task size)
     """
@@ -118,24 +246,28 @@ class BalancedMultiTaskSampler:
         self.task_indices = {}
         for task in dataset.task_names:
             indices = dataset.get_task_indices(task, split)
-            self.task_indices[task] = indices
+            if len(indices) > 0:
+                self.task_indices[task] = indices
+        
+        self.active_tasks = list(self.task_indices.keys())
+        
+        if not self.active_tasks:
+            raise ValueError(f"No tasks found for split '{split}'")
         
         # Determine samples per task
         if samples_per_task_per_epoch is None:
             samples_per_task_per_epoch = min(
-                len(v) for v in self.task_indices.values() if len(v) > 0
+                len(v) for v in self.task_indices.values()
             )
         
         self.samples_per_task = samples_per_task_per_epoch
-        self.epoch_length = len(dataset.task_names) * samples_per_task_per_epoch
+        self.epoch_length = len(self.active_tasks) * samples_per_task_per_epoch
     
     def __iter__(self) -> Iterator[List[int]]:
         """Yield batches of indices."""
         # Create pools with oversampling if needed
         task_pools = {}
         for task, indices in self.task_indices.items():
-            if len(indices) == 0:
-                continue
             shuffled = np.random.permutation(indices).tolist()
             while len(shuffled) < self.samples_per_task:
                 shuffled.extend(np.random.permutation(indices).tolist())
@@ -144,9 +276,8 @@ class BalancedMultiTaskSampler:
         # Interleave tasks
         all_indices = []
         for i in range(self.samples_per_task):
-            for task in self.dataset.task_names:
-                if task in task_pools:
-                    all_indices.append(task_pools[task][i])
+            for task in self.active_tasks:
+                all_indices.append(task_pools[task][i])
         
         np.random.shuffle(all_indices)
         
