@@ -1,54 +1,42 @@
-# SEAL-ADME Model Configuration
+# SEAL-ADME Model and Training Configuration
 
-# Data paths
-data:
-  graph_dir: data/graphs
-  split_dir: data/splits
-  
 # Model architecture
 model:
-  encoder_type: gcn  # gcn or gin
-  input_features: 25
-  hidden_features: 256
-  num_layers: 4
-  dropout: 0.1
-  regularize_encoder: 1.0e-4
-  regularize_contribution: 0.5
-  train_eps: false  # Only for GIN
+  encoder_type: gcn          # gcn or gin
+  input_features: 25         # Node feature dimension (from graph_featurizer)
+  hidden_features: 256       # Hidden dimension
+  num_layers: 4              # Number of GNN layers
+  dropout: 0.1               # Dropout rate
 
-# Pretraining configuration (classification)
+# Regularization
+regularization:
+  encoder: 1.0e-4            # L1 penalty on inter-fragment weights
+  contribution: 0.5          # L1 penalty on fragment contributions
+
+# Pretraining configuration (multi-task classification)
 pretrain:
   epochs: 50
   batch_size: 64
-  lr: 1.0e-3
+  learning_rate: 1.0e-3
   weight_decay: 1.0e-5
-  samples_per_task: 500  # null for balanced
-  grad_clip: 1.0
-  lr_patience: 5
-  early_stop_patience: 15
+  
+  # Balanced sampling ensures equal representation of all tasks
+  sampling: balanced
 
-# Finetuning configuration (regression)
+# Finetuning configuration (single-task regression)
 finetune:
-  task_names:
-    - solubility_aqsoldb
-    - caco2_wang
-    - half_life_obach
   epochs: 150
   batch_size: 64
-  lr: 3.0e-4
-  weight_decay: 1.0e-6
-  mse_weight: 1.0
-  grad_clip: 1.0
-  lr_patience: 8
-  early_stop_patience: 25
-  task_sampling: proportional  # proportional or round_robin
+  learning_rate: 3.0e-4
+  weight_decay: 1.0e-5
+  
+  # Early stopping
+  patience: 20
+  
+  # Whether to freeze encoder during finetuning
   freeze_encoder: false
-  validate_batch_size: 128
 
-# Inference configuration
-inference:
-  batch_size: 8
-  splits:
-    - test
-  visualize: true
-  vis_samples: 10
+# Output
+output:
+  save_interval: 10          # Save checkpoint every N epochs
+  log_interval: 1            # Log metrics every N epochs

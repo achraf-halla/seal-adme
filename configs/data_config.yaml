@@ -1,32 +1,47 @@
-# SEAL-ADME Data Configuration
+# SEAL-ADME Data Configuration (Simplified)
 
 # TDC dataset settings
 tdc:
-  # Pretraining uses classification tasks only
-  pretrain_classification_only: true
+  # Pretraining tasks (classification) - no splitting
+  pretrain_tasks:
+    - hia_hou
+    - pgp_broccatelli
+    - bioavailability_ma
+    - bbb_martins
+    - cyp2d6_veith
+    - cyp3a4_veith
+    - cyp2c9_veith
+    - cyp2d6_substrate_carbonmangels
+    - cyp3a4_substrate_carbonmangels
+    - cyp2c9_substrate_carbonmangels
+  
+  # Finetuning tasks (regression) - use TDC scaffold split
+  finetune_tasks:
+    - Caco2_Wang
+    - Solubility_AqSolDB
+    - Lipophilicity_AstraZeneca
 
-# ChEMBL Aurora kinase filters
-chembl:
-  aurora_filters:
-    min_target_count: 200
-    organism: "Homo sapiens"
-    assay_type: "B"  # Binding assays
-    require_pchembl: true
-
-# Splitting configuration
+# Splitting configuration (for finetuning only)
 splitting:
   seed: 42
-  fractions: [0.8, 0.1, 0.1]  # train, valid, test
-  method: scaffold  # scaffold or random
+  method: scaffold  # TDC native scaffold split
+  fractions: [0.7, 0.1, 0.2]  # train, valid, test
 
-# Graph construction
+# Graph featurization
 graph:
-  normalize_y: false  # Normalize target values
-  store_fragments: true  # Store fragment SMILES in graphs
+  # Atom features
+  include_optional: true   # degree, charge, aromatic, hybridization, etc.
+  include_numeric: true    # atomic num, mass, electronegativity, gasteiger
+  include_gasteiger: true  # Gasteiger partial charges
+  store_fragments: true    # Store fragment SMILES for interpretability
+
+# Normalization (for finetuning regression tasks)
+normalization:
+  enabled: true           # Normalize Y to mean=0, std=1
+  compute_from: train     # Compute stats from training set only
 
 # Output directories (relative to data_dir)
 directories:
-  raw: raw
-  clean: clean
-  splits: splits
   graphs: graphs
+  pretrain: graphs/pretrain
+  finetune: graphs/finetune
