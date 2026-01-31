@@ -4,7 +4,7 @@ Training script for SEAL-ADME.
 
 Supports:
 - pretrain: Multi-task classification pretraining
-- finetune: Single-task regression finetuning
+- finetune: Multi-task regression finetuning
 - all: Full pipeline (pretrain -> finetune)
 
 Usage:
@@ -30,7 +30,7 @@ from src.training import (
     load_pretrain_dataset,
     load_finetune_datasets,
     PretrainTrainer,
-    FinetuneTrainer,
+    MultiTaskFinetuneTrainer,
 )
 
 logging.basicConfig(
@@ -40,7 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def run_pretrain(args):
+def run_pretrain(args) -> Path:
     """Run pretraining."""
     logger.info("=" * 60)
     logger.info("PRETRAINING")
@@ -60,43 +60,43 @@ def run_pretrain(args):
         input_features=args.input_features,
         hidden_features=args.hidden_dim,
         num_layers=args.num_layers,
-        dropout=args.dropout
+        dropout=args.dropout,
+        regularize_encoder=args.reg_encoder,
+        regularize_contribution=args.reg_contribution
     )
     
-    logger.info(f"Model: {args.encoder_type.upper()} encoder, {args.hidden_dim} hidden")
+    logger.info(f"Model: {args.encoder_type.upper()} encoder, {args.hidden_dim} hidden dim")
     
     # Output directory
     output_dir = args.output_dir / "pretrain"
-    output_dir.mkdir(parents=True, exist_ok=True)
     
     # Trainer
     trainer = PretrainTrainer(
         model=model,
-        dataset=dataset,
-        batch_size=args.batch_size,
-        lr=args.lr,
+        train_dataset=dataset,
+        valid_dataset=dataset,  # Using same for pretrain (no split)
         device=args.device,
-        checkpoint_dir=output_dir / "checkpoints"
+        out_dir=output_dir
     )
     
     # Train
-    history = trainer.train(
+    results = trainer.train(
         epochs=args.pretrain_epochs,
-        log_interval=1,
-        save_interval=10
+        batch_size=args.batch_size,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
+        lr_patience=args.lr_patience,
+        early_stop_patience=args.early_stop_patience
     )
     
-    # Save history
-    with open(output_dir / "history.json", 'w') as f:
-        json.dump(history, f, indent=2)
-    
-    encoder_path = output_dir / "checkpoints" / "pretrained_encoder.pt"
+    encoder_path = output_dir / "pretrained_encoder.pt"
     logger.info(f"Pretrained encoder saved to: {encoder_path}")
     
     return encoder_path
 
 
-def run_finetune(args, encoder_path: Path = None):
+def run_finetune(args, encoder_path: Path = None) -> dict:
     """Run finetuning."""
     logger.info("=" * 60)
     logger.info("FINETUNING")
@@ -118,9 +118,10 @@ def run_finetune(args, encoder_path: Path = None):
             norm_stats[task_name] = {'mean': 0.0, 'std': 1.0}
     
     logger.info(f"Tasks: {list(datasets.keys())}")
-    logger.info(f"Normalization stats: {norm_stats}")
+    for task, stats in norm_stats.items():
+        logger.info(f"  {task}: mean={stats['mean']:.3f}, std={stats['std']:.3f}")
     
-    # Use provided encoder or from pretrain
+    # Use provided encoder or from args
     if encoder_path is None and args.encoder is not None:
         encoder_path = Path(args.encoder)
     
@@ -130,66 +131,53 @@ def run_finetune(args, encoder_path: Path = None):
         logger.info("Training from scratch (no pretrained encoder)")
         encoder_path = None
     
-    results = {}
+    # Build model
+    model = build_finetune_model(
+        task_names=list(datasets.keys()),
+        encoder_checkpoint=str(encoder_path) if encoder_path else None,
+        encoder_type=args.encoder_type,
+        input_features=args.input_features,
+        hidden_features=args.hidden_dim,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+        freeze_encoder=args.freeze_encoder,
+        regularize_encoder=args.reg_encoder,
+        regularize_contribution=args.reg_contribution,
+        device=args.device
+    )
     
-    for task_name, dataset in datasets.items():
-        logger.info("-" * 40)
-        logger.info(f"Training: {task_name}")
-        logger.info("-" * 40)
-        
-        # Build model
-        model = build_finetune_model(
-            task_names=[task_name],
-            encoder_checkpoint=str(encoder_path) if encoder_path else None,
-            encoder_type=args.encoder_type,
-            input_features=args.input_features,
-            hidden_features=args.hidden_dim,
-            num_layers=args.num_layers,
-            dropout=args.dropout,
-            freeze_encoder=args.freeze_encoder,
-            device=args.device
-        )
-        
-        # Output directory
-        task_output = args.output_dir / "finetune" / task_name
-        task_output.mkdir(parents=True, exist_ok=True)
-        
-        # Trainer
-        trainer = FinetuneTrainer(
-            model=model,
-            task_name=task_name,
-            train_graphs=dataset.train,
-            valid_graphs=dataset.valid,
-            test_graphs=dataset.test,
-            batch_size=args.batch_size,
-            lr=args.finetune_lr,
-            device=args.device,
-            checkpoint_dir=task_output / "checkpoints",
-            norm_stats=norm_stats.get(task_name, {'mean': 0.0, 'std': 1.0})
-        )
-        
-        # Train
-        history = trainer.train(
-            epochs=args.finetune_epochs,
-            patience=args.patience
-        )
-        
-        results[task_name] = {
-            'test_rmse_denorm': history.get('test_rmse_denorm'),
-            'best_epoch': history.get('best_epoch'),
-            'best_valid_rmse': history.get('best_valid_rmse')
-        }
+    # Output directory
+    output_dir = args.output_dir / "finetune"
     
-    # Save summary
-    summary_path = args.output_dir / "finetune" / "summary.json"
-    with open(summary_path, 'w') as f:
-        json.dump(results, f, indent=2)
+    # Trainer
+    trainer = MultiTaskFinetuneTrainer(
+        model=model,
+        task_datasets=datasets,
+        norm_stats=norm_stats,
+        device=args.device,
+        out_dir=output_dir
+    )
     
+    # Train
+    results = trainer.train(
+        epochs=args.finetune_epochs,
+        batch_size=args.batch_size,
+        lr=args.finetune_lr,
+        weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
+        lr_patience=args.lr_patience,
+        early_stop_patience=args.finetune_patience,
+        task_sampling=args.task_sampling
+    )
+    
+    # Print summary
     logger.info("=" * 60)
-    logger.info("FINETUNING RESULTS")
+    logger.info("FINETUNING RESULTS SUMMARY")
     logger.info("=" * 60)
-    for task, res in results.items():
-        logger.info(f"{task}: Test RMSE = {res['test_rmse_denorm']:.4f}")
+    for task in datasets.keys():
+        test_sp = results['final_metrics'][task]['test']['spearman']
+        test_rmse = results['final_metrics'][task]['test']['rmse_denorm']
+        logger.info(f"{task:25s}: Spearman={test_sp:.4f}, RMSE={test_rmse:.4f}")
     
     return results
 
@@ -213,14 +201,30 @@ def main():
     parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
     
+    # Regularization
+    parser.add_argument("--reg-encoder", type=float, default=1e-4, help="L1 on inter-fragment weights")
+    parser.add_argument("--reg-contribution", type=float, default=0.5, help="L1 on fragment contributions")
+    
     # Training arguments
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3, help="Pretrain learning rate")
     parser.add_argument("--finetune-lr", type=float, default=3e-4, help="Finetune learning rate")
+    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    
+    # Epochs
     parser.add_argument("--pretrain-epochs", type=int, default=50)
-    parser.add_argument("--finetune-epochs", type=int, default=150)
-    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--finetune-epochs", type=int, default=120)
+    
+    # Early stopping / LR scheduling
+    parser.add_argument("--lr-patience", type=int, default=5)
+    parser.add_argument("--early-stop-patience", type=int, default=15, help="Pretrain early stop")
+    parser.add_argument("--finetune-patience", type=int, default=25, help="Finetune early stop")
+    
+    # Finetune specific
     parser.add_argument("--freeze-encoder", action="store_true")
+    parser.add_argument("--task-sampling", type=str, default="round_robin", 
+                        choices=["round_robin", "proportional"])
     
     # Pretrained encoder (for finetune mode)
     parser.add_argument("--encoder", type=Path, default=None, help="Path to pretrained encoder")
