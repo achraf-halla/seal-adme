@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """
-Training script for SEAL-ADME models.
+Training script for SEAL-ADME.
 
 Supports:
-- Multi-task pretraining on classification tasks
-- Multi-task finetuning on regression tasks
-- Both GCN and GIN encoder architectures
+- pretrain: Multi-task classification pretraining
+- finetune: Single-task regression finetuning
+- all: Full pipeline (pretrain -> finetune)
 
 Usage:
-    # Pretraining
-    python scripts/train.py pretrain --config configs/model_config.yaml
-    
-    # Finetuning
-    python scripts/train.py finetune --config configs/model_config.yaml --encoder checkpoints/pretrained_encoder.pt
-    
-    # Full pipeline
-    python scripts/train.py all --config configs/model_config.yaml
+    python scripts/train.py pretrain --data-dir data --output-dir outputs
+    python scripts/train.py finetune --data-dir data --encoder outputs/pretrain/pretrained_encoder.pt
+    python scripts/train.py all --data-dir data --output-dir outputs
 """
 
 import argparse
@@ -24,366 +19,239 @@ import logging
 import sys
 from pathlib import Path
 
-import yaml
 import torch
-import pandas as pd
 
+# Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.data import load_graphs
+from src.data import PRETRAIN_TASKS, FINETUNE_TASKS
 from src.models import build_pretrain_model, build_finetune_model
 from src.training import (
-    PretrainDataset,
+    load_pretrain_dataset,
+    load_finetune_datasets,
     PretrainTrainer,
     FinetuneTrainer,
-    load_task_graphs,
-)
-from src.evaluation import (
-    extract_explanations_all_tasks,
-    visualize_all_tasks,
 )
 
-
-def setup_logging(log_file=None, level="INFO"):
-    """Configure logging."""
-    handlers = [logging.StreamHandler(sys.stdout)]
-    if log_file:
-        handlers.append(logging.FileHandler(log_file, mode='w'))
-    
-    logging.basicConfig(
-        level=getattr(logging, level.upper()),
-        format="%(asctime)s %(levelname)s [%(name)s]: %(message)s",
-        handlers=handlers
-    )
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s]: %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 
-def load_config(config_path):
-    """Load YAML configuration."""
-    with open(config_path) as f:
-        return yaml.safe_load(f)
-
-
-def load_pretrain_datasets(graph_dir, split_dir=None, pretrain_tasks=None):
-    """Load pretraining datasets from graph directory.
-    
-    Args:
-        graph_dir: Directory containing graph files
-        split_dir: Optional directory with parquet metadata
-        pretrain_tasks: List of task names to include (classification tasks only)
-    """
-    logger = logging.getLogger("load_pretrain")
-    
-    graph_dir = Path(graph_dir)
-    
-    # Default pretrain tasks (classification only)
-    if pretrain_tasks is None:
-        from src.data import PRETRAIN_TASKS
-        pretrain_tasks = PRETRAIN_TASKS
-    
-    logger.info(f"Loading pretrain datasets for tasks: {pretrain_tasks}")
-    logger.info(f"Graph directory: {graph_dir}")
-    
-    # Create dataset with task filter for training data
-    train_dataset = PretrainDataset(
-        graph_dir, 
-        metadata_df=None,
-        task_filter=pretrain_tasks
-    )
-    
-    # For validation, use same dataset but filter to 'valid' split when sampling
-    valid_dataset = train_dataset  # They share the same loaded graphs
-    
-    # Count actual train/valid samples
-    train_count = sum(
-        len(train_dataset.get_task_indices(task, 'train'))
-        for task in train_dataset.task_names
-    )
-    valid_count = sum(
-        len(train_dataset.get_task_indices(task, 'valid'))
-        for task in train_dataset.task_names
-    )
-    
-    logger.info(f"Loaded pretrain datasets: train={train_count}, valid={valid_count}")
-    
-    return train_dataset, valid_dataset
-
-
-def load_finetune_datasets(graph_dir, task_names):
-    """Load finetuning datasets as graph lists per task."""
-    logger = logging.getLogger("load_finetune")
-    
-    graph_dir = Path(graph_dir)
-    task_datasets = {}
-    
-    for task_name in task_names:
-        task_dir = graph_dir / task_name
-        if not task_dir.exists():
-            # Try alternate naming
-            for subdir in graph_dir.iterdir():
-                if subdir.is_dir() and task_name in subdir.name:
-                    task_dir = subdir
-                    break
-        
-        if not task_dir.exists():
-            logger.warning(f"Task directory not found: {task_dir}")
-            continue
-        
-        task_data = {'train': [], 'valid': [], 'test': []}
-        
-        for split in ['train', 'valid', 'test']:
-            # Try different file patterns
-            patterns = [
-                f"graph_*_{split}_*.pt",
-                f"*_{task_name}_{split}_*.pt",
-                f"graph_{task_name}_{split}_*.pt",
-            ]
-            
-            graphs = []
-            for pattern in patterns:
-                for path in sorted(task_dir.glob(pattern)):
-                    try:
-                        g = torch.load(path, weights_only=False)
-                        graphs.append(g)
-                    except Exception as e:
-                        logger.warning(f"Failed to load {path}: {e}")
-                
-                if graphs:
-                    break
-            
-            task_data[split] = graphs
-            logger.info(f"  {task_name}/{split}: {len(graphs)} graphs")
-        
-        task_datasets[task_name] = task_data
-    
-    return task_datasets
-
-
-def run_pretrain(config, args):
+def run_pretrain(args):
     """Run pretraining."""
-    logger = logging.getLogger("pretrain")
-    logger.info("Starting pretraining...")
+    logger.info("=" * 60)
+    logger.info("PRETRAINING")
+    logger.info("=" * 60)
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+    # Load data
+    logger.info(f"Loading pretrain data from {args.data_dir}/graphs/pretrain")
+    dataset = load_pretrain_dataset(args.data_dir / "graphs")
     
-    # Load datasets
-    pretrain_config = config.get("pretrain", {})
-    data_config = config.get("data", {})
-    
-    graph_dir = Path(data_config.get("graph_dir", "data/graphs"))
-    split_dir = Path(data_config.get("split_dir", "data/splits"))
-    
-    train_dataset, valid_dataset = load_pretrain_datasets(graph_dir, split_dir)
+    logger.info(f"Tasks: {dataset.task_names}")
+    logger.info(f"Total graphs: {len(dataset)}")
     
     # Build model
-    model_config = config.get("model", {})
-    encoder_type = model_config.get("encoder_type", "gcn")
-    
     model = build_pretrain_model(
-        task_names=train_dataset.task_names,
-        encoder_type=encoder_type,
-        input_features=model_config.get("input_features", 25),
-        hidden_features=model_config.get("hidden_features", 256),
-        num_layers=model_config.get("num_layers", 4),
-        dropout=model_config.get("dropout", 0.1),
-        regularize_encoder=model_config.get("regularize_encoder", 1e-4),
-        regularize_contribution=model_config.get("regularize_contribution", 0.5),
-        train_eps=model_config.get("train_eps", False),
+        task_names=dataset.task_names,
+        encoder_type=args.encoder_type,
+        input_features=args.input_features,
+        hidden_features=args.hidden_dim,
+        num_layers=args.num_layers,
+        dropout=args.dropout
     )
     
-    logger.info(f"Built {encoder_type.upper()} model with {len(train_dataset.task_names)} tasks")
+    logger.info(f"Model: {args.encoder_type.upper()} encoder, {args.hidden_dim} hidden")
     
-    # Create trainer
-    out_dir = Path(args.output_dir) / "pretrain" / "checkpoints"
+    # Output directory
+    output_dir = args.output_dir / "pretrain"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Trainer
     trainer = PretrainTrainer(
         model=model,
-        train_dataset=train_dataset,
-        valid_dataset=valid_dataset,
-        device=device,
-        out_dir=str(out_dir)
+        dataset=dataset,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        device=args.device,
+        checkpoint_dir=output_dir / "checkpoints"
     )
     
     # Train
-    results = trainer.train(
-        epochs=pretrain_config.get("epochs", 50),
-        batch_size=pretrain_config.get("batch_size", 64),
-        lr=pretrain_config.get("lr", 1e-3),
-        weight_decay=pretrain_config.get("weight_decay", 1e-5),
-        samples_per_task_per_epoch=pretrain_config.get("samples_per_task", None),
-        grad_clip=pretrain_config.get("grad_clip", 1.0),
-        lr_patience=pretrain_config.get("lr_patience", 5),
-        early_stop_patience=pretrain_config.get("early_stop_patience", 15),
+    history = trainer.train(
+        epochs=args.pretrain_epochs,
+        log_interval=1,
+        save_interval=10
     )
     
-    logger.info(f"Pretraining complete! Best AUROC: {results['best_val_auroc']:.4f}")
+    # Save history
+    with open(output_dir / "history.json", 'w') as f:
+        json.dump(history, f, indent=2)
     
-    return results, str(out_dir / "pretrained_encoder.pt")
+    encoder_path = output_dir / "checkpoints" / "pretrained_encoder.pt"
+    logger.info(f"Pretrained encoder saved to: {encoder_path}")
+    
+    return encoder_path
 
 
-def run_finetune(config, args, encoder_path=None):
+def run_finetune(args, encoder_path: Path = None):
     """Run finetuning."""
-    logger = logging.getLogger("finetune")
-    logger.info("Starting finetuning...")
+    logger.info("=" * 60)
+    logger.info("FINETUNING")
+    logger.info("=" * 60)
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+    # Load data
+    logger.info(f"Loading finetune data from {args.data_dir}/graphs/finetune")
+    datasets = load_finetune_datasets(args.data_dir / "graphs")
     
-    # Load config
-    finetune_config = config.get("finetune", {})
-    data_config = config.get("data", {})
-    model_config = config.get("model", {})
+    # Load normalization stats
+    norm_stats = {}
+    for task_name in datasets.keys():
+        stats_path = args.data_dir / "graphs" / "finetune" / task_name / "stats.json"
+        if stats_path.exists():
+            with open(stats_path) as f:
+                stats = json.load(f)
+                norm_stats[task_name] = stats.get('normalization', {'mean': 0.0, 'std': 1.0})
+        else:
+            norm_stats[task_name] = {'mean': 0.0, 'std': 1.0}
     
-    # Get task names
-    task_names = finetune_config.get("task_names", [
-        "solubility_aqsoldb", "caco2_wang", "half_life_obach"
-    ])
+    logger.info(f"Tasks: {list(datasets.keys())}")
+    logger.info(f"Normalization stats: {norm_stats}")
     
-    # Load datasets
-    graph_dir = Path(data_config.get("graph_dir", "data/graphs"))
-    task_datasets = load_finetune_datasets(graph_dir, task_names)
+    # Use provided encoder or from pretrain
+    if encoder_path is None and args.encoder is not None:
+        encoder_path = Path(args.encoder)
     
-    if not task_datasets:
-        raise ValueError("No task datasets loaded!")
-    
-    # Build model
-    encoder_type = model_config.get("encoder_type", "gcn")
-    encoder_checkpoint = encoder_path or args.encoder
-    
-    model = build_finetune_model(
-        task_names=list(task_datasets.keys()),
-        encoder_checkpoint=encoder_checkpoint,
-        encoder_type=encoder_type,
-        input_features=model_config.get("input_features", 25),
-        hidden_features=model_config.get("hidden_features", 256),
-        num_layers=model_config.get("num_layers", 4),
-        dropout=model_config.get("dropout", 0.1),
-        freeze_encoder=finetune_config.get("freeze_encoder", False),
-        regularize_encoder=model_config.get("regularize_encoder", 1e-4),
-        regularize_contribution=model_config.get("regularize_contribution", 0.5),
-        device=str(device),
-        train_eps=model_config.get("train_eps", False),
-    )
-    
-    if encoder_checkpoint:
-        logger.info(f"Loaded encoder from {encoder_checkpoint}")
+    if encoder_path and encoder_path.exists():
+        logger.info(f"Using pretrained encoder: {encoder_path}")
     else:
         logger.info("Training from scratch (no pretrained encoder)")
+        encoder_path = None
     
-    # Create trainer
-    out_dir = Path(args.output_dir) / "finetune" / "checkpoints"
-    trainer = FinetuneTrainer(
-        model=model,
-        task_datasets=task_datasets,
-        device=device,
-        out_dir=str(out_dir)
-    )
+    results = {}
     
-    # Train
-    results = trainer.train(
-        epochs=finetune_config.get("epochs", 120),
-        batch_size=finetune_config.get("batch_size", 64),
-        lr=finetune_config.get("lr", 3e-4),
-        weight_decay=finetune_config.get("weight_decay", 1e-6),
-        mse_weight=finetune_config.get("mse_weight", 1.0),
-        grad_clip=finetune_config.get("grad_clip", 1.0),
-        lr_patience=finetune_config.get("lr_patience", 8),
-        early_stop_patience=finetune_config.get("early_stop_patience", 25),
-        task_sampling=finetune_config.get("task_sampling", "proportional"),
-        validate_batch_size=finetune_config.get("validate_batch_size", 128),
-    )
-    
-    logger.info(f"Finetuning complete! Best Spearman: {results['best_avg_val_spearman']:.4f}")
-    
-    return results, model, task_datasets
-
-
-def run_inference(config, args, model, task_datasets):
-    """Run inference and extract explanations."""
-    logger = logging.getLogger("inference")
-    logger.info("Running inference and extracting explanations...")
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    inference_config = config.get("inference", {})
-    out_dir = Path(args.output_dir) / "finetune" / "inference"
-    
-    # Extract explanations
-    explanations = extract_explanations_all_tasks(
-        model=model,
-        task_datasets=task_datasets,
-        task_dataframes=None,
-        output_dir=str(out_dir),
-        batch_size=inference_config.get("batch_size", 8),
-        device=device,
-        splits=inference_config.get("splits", ["test"]),
-    )
-    
-    # Visualize
-    if inference_config.get("visualize", True):
-        visualize_all_tasks(
-            task_explanations=explanations,
-            output_dir=str(out_dir),
-            sample_size=inference_config.get("vis_samples", 10),
-            normalize=True,
-            cmap="RdBu_r",
+    for task_name, dataset in datasets.items():
+        logger.info("-" * 40)
+        logger.info(f"Training: {task_name}")
+        logger.info("-" * 40)
+        
+        # Build model
+        model = build_finetune_model(
+            task_names=[task_name],
+            encoder_checkpoint=str(encoder_path) if encoder_path else None,
+            encoder_type=args.encoder_type,
+            input_features=args.input_features,
+            hidden_features=args.hidden_dim,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+            freeze_encoder=args.freeze_encoder,
+            device=args.device
         )
+        
+        # Output directory
+        task_output = args.output_dir / "finetune" / task_name
+        task_output.mkdir(parents=True, exist_ok=True)
+        
+        # Trainer
+        trainer = FinetuneTrainer(
+            model=model,
+            task_name=task_name,
+            train_graphs=dataset.train,
+            valid_graphs=dataset.valid,
+            test_graphs=dataset.test,
+            batch_size=args.batch_size,
+            lr=args.finetune_lr,
+            device=args.device,
+            checkpoint_dir=task_output / "checkpoints",
+            norm_stats=norm_stats.get(task_name, {'mean': 0.0, 'std': 1.0})
+        )
+        
+        # Train
+        history = trainer.train(
+            epochs=args.finetune_epochs,
+            patience=args.patience
+        )
+        
+        results[task_name] = {
+            'test_rmse_denorm': history.get('test_rmse_denorm'),
+            'best_epoch': history.get('best_epoch'),
+            'best_valid_rmse': history.get('best_valid_rmse')
+        }
     
-    logger.info(f"Inference complete! Results saved to {out_dir}")
+    # Save summary
+    summary_path = args.output_dir / "finetune" / "summary.json"
+    with open(summary_path, 'w') as f:
+        json.dump(results, f, indent=2)
     
-    return explanations
+    logger.info("=" * 60)
+    logger.info("FINETUNING RESULTS")
+    logger.info("=" * 60)
+    for task, res in results.items():
+        logger.info(f"{task}: Test RMSE = {res['test_rmse_denorm']:.4f}")
+    
+    return results
 
 
 def main():
     parser = argparse.ArgumentParser(description="SEAL-ADME Training")
-    parser.add_argument("mode", choices=["pretrain", "finetune", "all"],
-                       help="Training mode")
-    parser.add_argument("--config", type=Path, default=Path("configs/model_config.yaml"))
-    parser.add_argument("--encoder", type=str, default=None,
-                       help="Path to pretrained encoder for finetuning")
+    parser.add_argument(
+        "mode",
+        choices=["pretrain", "finetune", "all"],
+        help="Training mode"
+    )
+    
+    # Data arguments
+    parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
-    parser.add_argument("--log-file", type=Path, default=None)
-    parser.add_argument("--log-level", type=str, default="INFO")
+    
+    # Model arguments
+    parser.add_argument("--encoder-type", type=str, default="gcn", choices=["gcn", "gin"])
+    parser.add_argument("--input-features", type=int, default=25)
+    parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--num-layers", type=int, default=4)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    
+    # Training arguments
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-3, help="Pretrain learning rate")
+    parser.add_argument("--finetune-lr", type=float, default=3e-4, help="Finetune learning rate")
+    parser.add_argument("--pretrain-epochs", type=int, default=50)
+    parser.add_argument("--finetune-epochs", type=int, default=150)
+    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--freeze-encoder", action="store_true")
+    
+    # Pretrained encoder (for finetune mode)
+    parser.add_argument("--encoder", type=Path, default=None, help="Path to pretrained encoder")
+    
+    # Device
+    parser.add_argument("--device", type=str, default=None)
     
     args = parser.parse_args()
     
-    setup_logging(args.log_file, args.log_level)
-    logger = logging.getLogger("main")
+    # Set device
+    if args.device is None:
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Load config
-    if args.config.exists():
-        config = load_config(args.config)
-        logger.info(f"Loaded config from {args.config}")
-    else:
-        logger.warning(f"Config not found: {args.config}, using defaults")
-        config = {}
+    logger.info(f"Device: {args.device}")
+    logger.info(f"Data directory: {args.data_dir}")
+    logger.info(f"Output directory: {args.output_dir}")
     
-    # Create output directory
     args.output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Run based on mode
-    encoder_path = args.encoder
+    # Run
+    if args.mode == "pretrain":
+        run_pretrain(args)
     
-    if args.mode in ["pretrain", "all"]:
-        logger.info("=" * 60)
-        logger.info("PRETRAINING")
-        logger.info("=" * 60)
-        pretrain_results, encoder_path = run_pretrain(config, args)
+    elif args.mode == "finetune":
+        run_finetune(args)
     
-    if args.mode in ["finetune", "all"]:
-        logger.info("=" * 60)
-        logger.info("FINETUNING")
-        logger.info("=" * 60)
-        finetune_results, model, task_datasets = run_finetune(config, args, encoder_path)
-        
-        # Run inference
-        logger.info("=" * 60)
-        logger.info("INFERENCE")
-        logger.info("=" * 60)
-        run_inference(config, args, model, task_datasets)
+    elif args.mode == "all":
+        encoder_path = run_pretrain(args)
+        run_finetune(args, encoder_path=encoder_path)
     
-    logger.info("=" * 60)
-    logger.info("COMPLETE")
-    logger.info("=" * 60)
+    logger.info("Done!")
 
 
 if __name__ == "__main__":
