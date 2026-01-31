@@ -1,41 +1,46 @@
 """
 SEAL-ADME Training Module.
 
-Provides trainers for multi-task pretraining (classification) and
-finetuning (regression), along with dataset utilities.
+Provides:
+- Dataset classes for pretraining and finetuning
+- Balanced multi-task sampling
+- Pretraining trainer for classification (AUROC/AUPRC)
+- Finetuning trainer for regression (Spearman/Pearson/RMSE)
 """
 
 from .datasets import (
     PretrainDataset,
-    GraphListDataset,
+    FinetuneDataset,
     BalancedMultiTaskSampler,
-    ProportionalTaskSampler,
-    load_task_graphs,
-    load_all_task_graphs,
-    create_data_loaders,
+    collate_with_padding,
+    create_dataloader,
+    load_pretrain_dataset,
+    load_finetune_datasets,
 )
 
 from .pretrain import PretrainTrainer
 
 from .finetune import (
-    FinetuneTrainer,
-    spearman_correlation,
-    pearson_correlation,
+    MultiTaskFinetuneTrainer,
+    SingleTaskFinetuneTrainer,
+    spearman_scorer,
+    pearson_scorer,
 )
 
 __all__ = [
     # Datasets
     "PretrainDataset",
-    "GraphListDataset",
+    "FinetuneDataset",
     "BalancedMultiTaskSampler",
-    "ProportionalTaskSampler",
-    "load_task_graphs",
-    "load_all_task_graphs",
-    "create_data_loaders",
+    "collate_with_padding",
+    "create_dataloader",
+    "load_pretrain_dataset",
+    "load_finetune_datasets",
     # Trainers
     "PretrainTrainer",
-    "FinetuneTrainer",
+    "MultiTaskFinetuneTrainer",
+    "SingleTaskFinetuneTrainer",
     # Utilities
-    "spearman_correlation",
-    "pearson_correlation",
+    "spearman_scorer",
+    "pearson_scorer",
 ]
