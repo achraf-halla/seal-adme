@@ -1,12 +1,10 @@
 """
 SEAL-ADME Data Processing Module.
 
-This module provides utilities for:
-- Loading data from TDC and ChEMBL
-- SMILES validation and standardization
-- Scaffold-based data splitting
-- BRICS molecular fragmentation
-- PyG graph construction
+Simplified pipeline for:
+- Loading ADME datasets from TDC
+- Graph featurization with BRICS decomposition
+- Normalization for regression tasks
 """
 
 from .constants import (
@@ -14,53 +12,28 @@ from .constants import (
     FINETUNE_TASKS,
     ATOM_TYPE_SET,
     HYBRIDIZATION_SET,
+    HALOGEN_ATOMIC_NUMS,
     PAULING_ELECTRONEGATIVITY,
     DEFAULT_ELECTRONEGATIVITY,
-    HALOGEN_ATOMIC_NUMS,
-    META_COLUMNS,
     STANDARD_COLUMNS,
-    AURORA_SEARCH_TERMS,
+    META_COLUMNS,
     DEFAULT_SPLIT_FRACTIONS,
+    DEFAULT_INPUT_FEATURES,
     DEFAULT_HIDDEN_DIM,
     DEFAULT_NUM_LAYERS,
     DEFAULT_DROPOUT,
-    DEFAULT_INPUT_FEATURES,
+    AURORA_SEARCH_TERMS,
 )
 
 from .loaders import (
     TDCLoader,
-    ChEMBLAuroraLoader,
-    filter_aurora_data,
-    convert_aurora_to_standard,
-    infer_task_type,
+    load_pretrain_data,
+    load_finetune_data,
 )
 
-from .preprocessing import (
-    canonicalize_smiles,
-    validate_smiles_column,
-    deduplicate_by_label_consistency,
-    standardize_dataframe,
-    DataPreprocessor,
-)
-
-from .splitting import (
-    create_scaffold_split,
-    create_random_split,
-    split_by_task,
-)
-
-from .fragmentation import (
-    brics_decompose,
-    get_fragment_membership_matrix,
-    get_edge_break_mask,
+from .graph_featurizer import (
+    GraphFeaturizer,
     FragmentExtractor,
-)
-
-from .graph_builder import (
-    one_hot_encode,
-    get_atom_features,
-    mol_to_graph,
-    GraphBuilder,
     save_graphs,
     load_graphs,
 )
@@ -71,43 +44,24 @@ __all__ = [
     "FINETUNE_TASKS",
     "ATOM_TYPE_SET",
     "HYBRIDIZATION_SET",
+    "HALOGEN_ATOMIC_NUMS",
     "PAULING_ELECTRONEGATIVITY",
     "DEFAULT_ELECTRONEGATIVITY",
-    "HALOGEN_ATOMIC_NUMS",
-    "META_COLUMNS",
     "STANDARD_COLUMNS",
-    "AURORA_SEARCH_TERMS",
+    "META_COLUMNS",
     "DEFAULT_SPLIT_FRACTIONS",
+    "DEFAULT_INPUT_FEATURES",
     "DEFAULT_HIDDEN_DIM",
     "DEFAULT_NUM_LAYERS",
     "DEFAULT_DROPOUT",
-    "DEFAULT_INPUT_FEATURES",
+    "AURORA_SEARCH_TERMS",
     # Loaders
     "TDCLoader",
-    "ChEMBLAuroraLoader",
-    "filter_aurora_data",
-    "convert_aurora_to_standard",
-    "infer_task_type",
-    # Preprocessing
-    "canonicalize_smiles",
-    "validate_smiles_column",
-    "deduplicate_by_label_consistency",
-    "standardize_dataframe",
-    "DataPreprocessor",
-    # Splitting
-    "create_scaffold_split",
-    "create_random_split",
-    "split_by_task",
-    # Fragmentation
-    "brics_decompose",
-    "get_fragment_membership_matrix",
-    "get_edge_break_mask",
+    "load_pretrain_data",
+    "load_finetune_data",
+    # Graph featurization
+    "GraphFeaturizer",
     "FragmentExtractor",
-    # Graph building
-    "one_hot_encode",
-    "get_atom_features",
-    "mol_to_graph",
-    "GraphBuilder",
     "save_graphs",
     "load_graphs",
 ]
