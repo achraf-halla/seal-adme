@@ -1,54 +1,27 @@
-# SEAL-ADME: Fragment-Aware Molecular Property Prediction
+# SEAL-ADME v2: Fragment-Aware Molecular Property Prediction
 
-Learning Molecular Representations for ADME Prediction and Interpretability: A Case Study on Aurora Kinase Inhibitors
+Simplified implementation of the SEAL (Substructure-Explainable Active Learning) framework for ADME property prediction.
 
-**M.Sc. Thesis - Bielefeld University, 2026**
+## Features
 
-## Overview
-
-This repository implements an extended SEAL (Substructure-Explainable Active Learning) framework for predicting ADME (Absorption, Distribution, Metabolism, Excretion) properties of drug-like molecules. The framework provides:
-
-- **Fragment-aware graph neural networks** using BRICS-based molecular decomposition
-- **Multiple GNN backbones** (GCN, GIN) with separate intra/inter-fragment message passing
-- **Multitask learning** for simultaneous prediction across ADME endpoints
-- **Built-in interpretability** through fragment-level attributions
-
-## Key Features
-
-### SEAL Architecture
-
-Extension of the original SEAL framework (Musial et al., 2025) with:
-
-- Graph Isomorphism Network (GIN) backbone for increased expressiveness
-- Separate transformations for intra-fragment and inter-fragment message passing
-- Fragment contributions sum directly to predictions (interpretable by design)
-- Decoupled encoder/head design for transfer learning
-
-### Supported Endpoints
-
-**Pretraining (Classification):**
-- HIA, PGP, Bioavailability, BBB penetration
-- CYP450 inhibition and substrate prediction
-
-**Finetuning (Regression):**
-- Aqueous solubility (TDC: AqSolDB)
-- Caco-2 permeability (TDC)
-- Half-life (TDC: Obach)
-- Aurora A/B kinase potency (ChEMBL)
+- **BRICS-based fragmentation** for interpretable molecular representations
+- **Multi-task pretraining** on 10 classification tasks
+- **Single-task finetuning** on 3 regression tasks
+- **Fragment-level explanations** - contributions sum to prediction
 
 ## Installation
 
 ```bash
-# Clone the repository
+# Clone repository
 git clone https://github.com/achraf-halla/seal-adme.git
 cd seal-adme
 
-# Create conda environment
+# Create environment
 conda create -n seal-adme python=3.10
 conda activate seal-adme
 
 # Install PyTorch (adjust for your CUDA version)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 
 # Install PyTorch Geometric
 pip install torch-geometric
@@ -57,148 +30,184 @@ pip install torch-geometric
 pip install -r requirements.txt
 ```
 
-## Project Structure
+## Quick Start
 
-```
-seal-adme/
-├── configs/
-│   ├── data_config.yaml       # Data processing configuration
-│   └── model_config.yaml      # Model and training configuration
-├── src/
-│   ├── data/
-│   │   ├── constants.py       # Shared constants
-│   │   ├── loaders.py         # TDC and ChEMBL data loading
-│   │   ├── preprocessing.py   # SMILES validation/deduplication
-│   │   ├── splitting.py       # Scaffold-based splitting
-│   │   ├── fragmentation.py   # BRICS decomposition
-│   │   └── graph_builder.py   # PyG graph creation
-│   ├── models/
-│   │   ├── layers.py          # SEALConv, SEALGINConv layers
-│   │   ├── encoder.py         # Fragment-aware encoders
-│   │   └── seal.py            # Multi-task models
-│   ├── training/
-│   │   ├── datasets.py        # Dataset classes and samplers
-│   │   ├── pretrain.py        # Pretraining trainer
-│   │   └── finetune.py        # Finetuning trainer
-│   └── evaluation/
-│       ├── explanations.py    # Fragment attribution extraction
-│       └── visualization.py   # Molecule visualization
-├── scripts/
-│   ├── prepare_data.py        # Data preparation pipeline
-│   └── train.py               # Training script
-└── data/                      # Data directory (not tracked)
-```
-
-## Usage
-
-### 1. Data Preparation
+### 1. Prepare Data
 
 ```bash
-# Run complete data pipeline
-python scripts/prepare_data.py --config configs/data_config.yaml
-
-# Or run specific steps
-python scripts/prepare_data.py --steps load_tdc,preprocess,split,graphs
+python scripts/prepare_data.py --data-dir data
 ```
 
-### 2. Model Training
+Creates:
+- `data/graphs/pretrain/` - 10 classification tasks (no split)
+- `data/graphs/finetune/{task}/{split}/` - 3 regression tasks with scaffold split
+
+### 2. Train
 
 ```bash
-# Pretraining only
-python scripts/train.py pretrain --config configs/model_config.yaml
+# Full pipeline: pretrain + finetune
+python scripts/train.py all --data-dir data --output-dir outputs
 
-# Finetuning with pretrained encoder
-python scripts/train.py finetune --config configs/model_config.yaml \
-    --encoder outputs/pretrain/checkpoints/pretrained_encoder.pt
-
-# Full pipeline (pretrain + finetune)
-python scripts/train.py all --config configs/model_config.yaml
+# Or separately:
+python scripts/train.py pretrain --data-dir data --output-dir outputs
+python scripts/train.py finetune --data-dir data --encoder outputs/pretrain/checkpoints/pretrained_encoder.pt
 ```
 
-### 3. Python API
+### 3. Use in Python
 
 ```python
-from src.data import GraphBuilder, create_scaffold_split
-from src.models import build_finetune_model
-from src.training import FinetuneTrainer
-from src.evaluation import extract_explanations, visualize_explanations
+from src.training import load_pretrain_dataset, load_finetune_datasets
+from src.models import build_pretrain_model, build_finetune_model
 
-# Build graphs from SMILES
-builder = GraphBuilder(store_fragments=True)
-graphs = builder.build_from_dataframe(df)
+# Load data
+pretrain = load_pretrain_dataset("data/graphs")
+finetune = load_finetune_datasets("data/graphs")
 
-# Create model
+# Build model
 model = build_finetune_model(
-    task_names=['solubility_aqsoldb', 'caco2_wang'],
-    encoder_type='gin',
-    encoder_checkpoint='pretrained_encoder.pt'
+    task_names=["Caco2_Wang"],
+    encoder_checkpoint="outputs/pretrain/checkpoints/pretrained_encoder.pt",
+    encoder_type="gcn",
+    hidden_features=256
 )
-
-# Train
-trainer = FinetuneTrainer(model, task_datasets)
-results = trainer.train(epochs=150)
-
-# Extract and visualize explanations
-explanations = extract_explanations(model, 'solubility_aqsoldb', test_graphs)
-visualize_explanations('solubility_aqsoldb', explanations, sample_size=10)
 ```
+
+## Data Pipeline
+
+### Pretraining Tasks (Classification)
+| Task | Description |
+|------|-------------|
+| hia_hou | Human Intestinal Absorption |
+| pgp_broccatelli | P-glycoprotein Inhibition |
+| bioavailability_ma | Bioavailability |
+| bbb_martins | Blood-Brain Barrier |
+| cyp2d6_veith | CYP2D6 Inhibition |
+| cyp3a4_veith | CYP3A4 Inhibition |
+| cyp2c9_veith | CYP2C9 Inhibition |
+| cyp2d6_substrate_carbonmangels | CYP2D6 Substrate |
+| cyp3a4_substrate_carbonmangels | CYP3A4 Substrate |
+| cyp2c9_substrate_carbonmangels | CYP2C9 Substrate |
+
+**No splitting** - all data used for training.
+
+### Finetuning Tasks (Regression)
+| Task | Description | Split |
+|------|-------------|-------|
+| Caco2_Wang | Caco-2 Permeability | 70/10/20 |
+| Solubility_AqSolDB | Aqueous Solubility | 70/10/20 |
+| Lipophilicity_AstraZeneca | LogD | 70/10/20 |
+
+**TDC scaffold split** with normalized labels (mean=0, std=1).
+
+## Graph Structure
+
+Each molecular graph contains:
+
+| Attribute | Shape | Description |
+|-----------|-------|-------------|
+| `x` | [N, 25] | Atom features |
+| `edge_index` | [2, E] | Bond connectivity |
+| `s` | [N, K] | Fragment membership matrix |
+| `mask` | [E] | Edge mask (1=intra, 0=inter fragment) |
+| `y` | [1] | Target value |
+| `task_name` | str | Task identifier |
+| `smiles` | str | Original SMILES |
+| `fragment_smiles` | list | Fragment SMILES for interpretability |
 
 ## Model Architecture
 
-### Fragment-Aware Message Passing
-
-The key innovation is separate linear transformations for intra-fragment and inter-fragment edges:
-
 ```
-h_i^{(l+1)} = σ(W_in · Σ_{j∈N_in(i)} h_j^{(l)} + W_out · Σ_{j∈N_out(i)} h_j^{(l)} + W_root · h_i^{(l)})
+Input Graph
+    │
+    ▼
+┌─────────────────────────────┐
+│  Fragment-Aware Encoder     │
+│  (GCN or GIN with SEAL)     │
+│  - Separate intra/inter     │
+│    fragment message passing │
+└─────────────────────────────┘
+    │
+    ▼
+Fragment Embeddings [B, K, H]
+    │
+    ▼
+┌─────────────────────────────┐
+│  Task Head (Linear)         │
+│  fragment_contributions     │
+└─────────────────────────────┘
+    │
+    ▼
+Sum over fragments → Prediction
 ```
-
-Where:
-- `N_in(i)`: Neighbors within same fragment
-- `N_out(i)`: Neighbors in different fragments
-- `W_in`, `W_out`, `W_root`: Learnable weight matrices
-
-This enables:
-1. **Interpretable attributions**: Fragment contributions sum to the prediction
-2. **Regularization**: L1 penalty on W_out encourages local explanations
-3. **Transfer learning**: Encoder learns general fragment representations
 
 ## Configuration
 
-### Encoder Types
+### configs/data_config.yaml
+```yaml
+tdc:
+  pretrain_tasks: [hia_hou, pgp_broccatelli, ...]
+  finetune_tasks: [Caco2_Wang, Solubility_AqSolDB, Lipophilicity_AstraZeneca]
 
-**GCN (default):**
+splitting:
+  seed: 42
+  method: scaffold
+  fractions: [0.7, 0.1, 0.2]
+
+normalization:
+  enabled: true
+  compute_from: train
+```
+
+### configs/model_config.yaml
 ```yaml
 model:
   encoder_type: gcn
   hidden_features: 256
   num_layers: 4
+  dropout: 0.1
+
+pretrain:
+  epochs: 50
+  batch_size: 64
+  learning_rate: 1.0e-3
+
+finetune:
+  epochs: 150
+  batch_size: 64
+  learning_rate: 3.0e-4
+  patience: 20
 ```
 
-**GIN (more expressive):**
-```yaml
-model:
-  encoder_type: gin
-  hidden_features: 256
-  num_layers: 4
-  train_eps: false
+## Project Structure
+
 ```
-
-### Training Settings
-
-See `configs/model_config.yaml` for full configuration options.
-
-## Data Sources
-
-- **TDC (Therapeutics Data Commons)**: ADME benchmark datasets
-  - https://tdcommons.ai/
-- **ChEMBL**: Aurora kinase bioactivity data
-  - https://www.ebi.ac.uk/chembl/
+seal-adme/
+├── configs/
+│   ├── data_config.yaml
+│   └── model_config.yaml
+├── scripts/
+│   ├── prepare_data.py      # Data preparation
+│   └── train.py             # Training CLI
+├── src/
+│   ├── data/
+│   │   ├── constants.py     # Task lists
+│   │   ├── loaders.py       # TDC data loading
+│   │   └── graph_featurizer.py  # BRICS graph construction
+│   ├── models/
+│   │   ├── layers.py        # SEALConv layers
+│   │   ├── encoder.py       # GCN/GIN encoders
+│   │   └── seal.py          # Multi-task models
+│   ├── training/
+│   │   ├── datasets.py      # Dataset classes
+│   │   ├── pretrain.py      # Pretraining trainer
+│   │   └── finetune.py      # Finetuning trainer
+│   └── evaluation/
+│       ├── explanations.py  # Fragment attribution
+│       └── visualization.py # Molecule visualization
+└── requirements.txt
+```
 
 ## References
 
 - Musial et al. (2025). SEAL: Substructure-Explainable Active Learning for Molecular Property Prediction.
-
-## License
-
-MIT License
+- TDC: https://tdcommons.ai/
