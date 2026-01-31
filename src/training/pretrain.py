@@ -23,11 +23,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch_geometric.loader import DataLoader
 from sklearn.metrics import roc_auc_score, average_precision_score
 from tqdm import tqdm
 
-from .datasets import PretrainDataset, collate_with_padding
+from .datasets import PretrainDataset, collate_with_padding, create_dataloader
 
 logger = logging.getLogger(__name__)
 
@@ -82,10 +81,7 @@ class PretrainTrainer:
         if len(graphs) == 0:
             return np.array([]), np.array([])
         
-        loader = DataLoader(
-            graphs, batch_size=batch_size, shuffle=False,
-            collate_fn=collate_with_padding
-        )
+        loader = create_dataloader(graphs, batch_size=batch_size, shuffle=False)
         
         preds_list, trues_list = [], []
         with torch.no_grad():

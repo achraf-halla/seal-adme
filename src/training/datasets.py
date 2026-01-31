@@ -9,8 +9,8 @@ from typing import Dict, List, Optional, Iterator
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader as TorchDataLoader  # Use standard PyTorch DataLoader
 from torch_geometric.data import Data, Batch
-from torch_geometric.loader import DataLoader
 
 logger = logging.getLogger(__name__)
 
@@ -233,9 +233,13 @@ def create_dataloader(
     batch_size: int,
     shuffle: bool = True,
     num_workers: int = 0
-) -> DataLoader:
-    """Create DataLoader with padding collate function."""
-    return DataLoader(
+) -> TorchDataLoader:
+    """Create DataLoader with padding collate function.
+    
+    Uses standard PyTorch DataLoader (not PyG) to ensure
+    our custom collate_with_padding is used.
+    """
+    return TorchDataLoader(
         graphs,
         batch_size=batch_size,
         shuffle=shuffle,

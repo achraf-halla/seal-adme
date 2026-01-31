@@ -26,11 +26,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch_geometric.loader import DataLoader
 from sklearn.metrics import mean_squared_error
 from scipy.stats import spearmanr, pearsonr
 
-from .datasets import FinetuneDataset, collate_with_padding
+from .datasets import FinetuneDataset, collate_with_padding, create_dataloader
 
 logger = logging.getLogger(__name__)
 
@@ -106,10 +105,7 @@ class MultiTaskFinetuneTrainer:
         if len(graphs) == 0:
             return np.array([]), np.array([])
         
-        loader = DataLoader(
-            graphs, batch_size=batch_size, shuffle=False,
-            collate_fn=collate_with_padding
-        )
+        loader = create_dataloader(graphs, batch_size=batch_size, shuffle=False)
         
         preds_list, trues_list = [], []
         with torch.no_grad():
@@ -210,10 +206,9 @@ class MultiTaskFinetuneTrainer:
         task_iters = {}
         for task_name in self.task_names:
             train_graphs = self.task_datasets[task_name].train
-            loader = DataLoader(
+            loader = create_dataloader(
                 train_graphs, batch_size=batch_size, shuffle=True,
-                num_workers=num_workers, collate_fn=collate_with_padding,
-                pin_memory=torch.cuda.is_available()
+                num_workers=num_workers
             )
             task_loaders[task_name] = loader
             task_iters[task_name] = iter(loader)
