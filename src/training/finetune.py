@@ -2,32 +2,429 @@
 Finetuning trainer for regression tasks.
 
 Trains task-specific heads on top of a pretrained encoder.
-Supports both frozen and unfrozen encoder training.
+
+Features:
+- MSE loss with regularization
+- Spearman/Pearson/RMSE evaluation
+- LR scheduler with patience
+- Early stopping
+- AMP (mixed precision) training
+- Round-robin or proportional task sampling
+- Saves predictions to numpy files
 """
 
+import copy
 import json
 import logging
+import math
+import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
+from collections import defaultdict
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
+from torch.optim import Adam
 from torch_geometric.loader import DataLoader
-from tqdm import tqdm
+from sklearn.metrics import mean_squared_error
+from scipy.stats import spearmanr, pearsonr
 
-from .datasets import FinetuneDataset, collate_with_padding, create_dataloader
+from .datasets import FinetuneDataset, collate_with_padding
 
 logger = logging.getLogger(__name__)
 
 
-class FinetuneTrainer:
+def spearman_scorer(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Compute Spearman correlation, handling NaN."""
+    if len(y_true) < 2:
+        return float('nan')
+    r = spearmanr(y_true, y_pred).correlation
+    return float('nan') if np.isnan(r) else float(r)
+
+
+def pearson_scorer(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Compute Pearson correlation, handling NaN."""
+    if len(y_true) < 2:
+        return float('nan')
+    r, _ = pearsonr(y_true, y_pred)
+    return float('nan') if np.isnan(r) else float(r)
+
+
+class MultiTaskFinetuneTrainer:
+    """
+    Trainer for multi-task regression finetuning.
+    
+    Supports training on multiple regression tasks simultaneously
+    with round-robin or proportional task sampling.
+    """
+    
+    def __init__(
+        self,
+        model: nn.Module,
+        task_datasets: Dict[str, FinetuneDataset],
+        norm_stats: Dict[str, Dict[str, float]] = None,
+        device: str = None,
+        out_dir: Path = None
+    ):
+        """
+        Args:
+            model: MultiTaskRegressionModel
+            task_datasets: Dict of task_name -> FinetuneDataset
+            norm_stats: Dict of task_name -> {'mean': float, 'std': float}
+            device: Device to train on
+            out_dir: Directory for saving checkpoints
+        """
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = model.to(self.device)
+        self.task_datasets = task_datasets
+        self.task_names = list(task_datasets.keys())
+        self.norm_stats = norm_stats or {t: {'mean': 0.0, 'std': 1.0} for t in self.task_names}
+        
+        self.out_dir = Path(out_dir) if out_dir else Path("checkpoints/finetune")
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info("=" * 60)
+        logger.info(f"MultiTaskFinetuneTrainer initialized with {len(self.task_names)} tasks:")
+        for task_name in self.task_names:
+            ds = task_datasets[task_name]
+            logger.info(
+                f"  {task_name:25s} - Train: {len(ds.train):5d}, "
+                f"Valid: {len(ds.valid):4d}, Test: {len(ds.test):4d}"
+            )
+        logger.info("=" * 60)
+    
+    def _predict_list(
+        self,
+        task_name: str,
+        graphs: List,
+        batch_size: int = 128
+    ) -> tuple:
+        """Predict on a list of graphs."""
+        self.model.eval()
+        
+        if len(graphs) == 0:
+            return np.array([]), np.array([])
+        
+        loader = DataLoader(
+            graphs, batch_size=batch_size, shuffle=False,
+            collate_fn=collate_with_padding
+        )
+        
+        preds_list, trues_list = [], []
+        with torch.no_grad():
+            for batch in loader:
+                batch = batch.to(self.device)
+                out = self.model(batch, task_name)
+                preds = out['output'].view(-1).cpu().numpy()
+                trues = batch.y.view(-1).cpu().numpy()
+                preds_list.append(preds)
+                trues_list.append(trues)
+        
+        return np.concatenate(trues_list), np.concatenate(preds_list)
+    
+    def _evaluate_all_tasks(self, batch_size: int = 128) -> Dict:
+        """Evaluate Spearman/RMSE on all tasks and splits."""
+        metrics = {}
+        
+        for task_name in self.task_names:
+            task_metrics = {}
+            ds = self.task_datasets[task_name]
+            
+            for split, graphs in [('train', ds.train), ('valid', ds.valid), ('test', ds.test)]:
+                if len(graphs) == 0:
+                    task_metrics[split] = {
+                        'spearman': float('nan'),
+                        'rmse': float('nan'),
+                        'pearson': float('nan')
+                    }
+                    continue
+                
+                y_true, y_pred = self._predict_list(task_name, graphs, batch_size)
+                
+                # Metrics in normalized space
+                spearman = spearman_scorer(y_true, y_pred)
+                pearson = pearson_scorer(y_true, y_pred)
+                rmse = math.sqrt(mean_squared_error(y_true, y_pred)) if len(y_true) > 0 else float('nan')
+                
+                # Denormalized RMSE
+                std = self.norm_stats[task_name]['std']
+                rmse_denorm = rmse * std
+                
+                task_metrics[split] = {
+                    'spearman': spearman,
+                    'pearson': pearson,
+                    'rmse': rmse,
+                    'rmse_denorm': rmse_denorm
+                }
+            
+            metrics[task_name] = task_metrics
+        
+        return metrics
+    
+    def train(
+        self,
+        epochs: int = 120,
+        batch_size: int = 64,
+        lr: float = 3e-4,
+        weight_decay: float = 1e-6,
+        mse_weight: float = 1.0,
+        grad_clip: float = 1.0,
+        lr_patience: int = 8,
+        early_stop_patience: int = 25,
+        task_sampling: str = 'round_robin',
+        num_workers: int = 0
+    ) -> Dict:
+        """
+        Full training loop.
+        
+        Args:
+            epochs: Maximum epochs
+            batch_size: Batch size
+            lr: Learning rate
+            weight_decay: L2 regularization
+            mse_weight: Weight for MSE loss
+            grad_clip: Gradient clipping norm
+            lr_patience: Patience for LR scheduler
+            early_stop_patience: Patience for early stopping
+            task_sampling: 'round_robin' or 'proportional'
+            num_workers: DataLoader workers
+            
+        Returns:
+            Training results dict
+        """
+        torch.manual_seed(42)
+        np.random.seed(42)
+        
+        optimizer = Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', patience=lr_patience, factor=0.5
+        )
+        
+        # AMP setup
+        use_amp = torch.cuda.is_available()
+        scaler = torch.amp.GradScaler() if use_amp else None
+        
+        # Create data loaders for each task
+        task_loaders = {}
+        task_iters = {}
+        for task_name in self.task_names:
+            train_graphs = self.task_datasets[task_name].train
+            loader = DataLoader(
+                train_graphs, batch_size=batch_size, shuffle=True,
+                num_workers=num_workers, collate_fn=collate_with_padding,
+                pin_memory=torch.cuda.is_available()
+            )
+            task_loaders[task_name] = loader
+            task_iters[task_name] = iter(loader)
+        
+        # Task sampling probabilities
+        if task_sampling == 'proportional':
+            total = sum(len(self.task_datasets[t].train) for t in self.task_names)
+            task_probs = [len(self.task_datasets[t].train) / total for t in self.task_names]
+        else:
+            task_probs = [1.0 / len(self.task_names)] * len(self.task_names)
+        
+        logger.info(f"Starting finetuning with {task_sampling} task sampling")
+        logger.info(f"Task probabilities: {dict(zip(self.task_names, task_probs))}")
+        
+        best_state = None
+        best_avg_val_spearman = -999.0
+        best_epoch = -1
+        epochs_no_improve = 0
+        
+        history = {
+            'train_loss': [],
+            'task_train_loss': {task: [] for task in self.task_names},
+            'avg_val_spearman': []
+        }
+        
+        loss_fn = nn.MSELoss()
+        
+        for epoch in range(1, epochs + 1):
+            self.model.train()
+            epoch_loss = 0.0
+            task_losses = defaultdict(float)
+            task_batch_counts = defaultdict(int)
+            
+            max_batches = max(len(task_loaders[task]) for task in self.task_names)
+            
+            for batch_idx in range(max_batches):
+                # Select task
+                if task_sampling == 'round_robin':
+                    task_name = self.task_names[batch_idx % len(self.task_names)]
+                else:
+                    task_name = np.random.choice(self.task_names, p=task_probs)
+                
+                # Get batch
+                try:
+                    batch = next(task_iters[task_name])
+                except StopIteration:
+                    task_iters[task_name] = iter(task_loaders[task_name])
+                    batch = next(task_iters[task_name])
+                
+                batch = batch.to(self.device)
+                optimizer.zero_grad()
+                
+                if use_amp:
+                    with torch.amp.autocast(device_type="cuda"):
+                        out = self.model(batch, task_name)
+                        preds = out['output'].view(-1)
+                        trues = batch.y.view(-1)
+                        mse = loss_fn(preds, trues)
+                        reg = out.get('losses', torch.tensor(0.0, device=self.device))
+                        loss = mse_weight * mse + reg
+                    
+                    if not torch.isfinite(loss):
+                        continue
+                    
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    if grad_clip:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    out = self.model(batch, task_name)
+                    preds = out['output'].view(-1)
+                    trues = batch.y.view(-1)
+                    mse = loss_fn(preds, trues)
+                    reg = out.get('losses', torch.tensor(0.0, device=self.device))
+                    loss = mse_weight * mse + reg
+                    
+                    if not torch.isfinite(loss):
+                        continue
+                    
+                    loss.backward()
+                    if grad_clip:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+                    optimizer.step()
+                
+                epoch_loss += float(loss.detach().cpu())
+                task_losses[task_name] += float(loss.detach().cpu())
+                task_batch_counts[task_name] += 1
+            
+            # Record history
+            train_loss = epoch_loss / max(1, max_batches)
+            history['train_loss'].append(train_loss)
+            
+            for task in self.task_names:
+                avg_task_loss = task_losses[task] / max(1, task_batch_counts[task])
+                history['task_train_loss'][task].append(avg_task_loss)
+            
+            # Validation
+            metrics = self._evaluate_all_tasks(batch_size=batch_size)
+            
+            val_spearmans = [
+                metrics[task]['valid']['spearman']
+                for task in self.task_names
+                if not np.isnan(metrics[task]['valid']['spearman'])
+            ]
+            avg_val_spearman = np.mean(val_spearmans) if val_spearmans else -1.0
+            history['avg_val_spearman'].append(avg_val_spearman)
+            
+            scheduler.step(avg_val_spearman)
+            
+            # Check for improvement
+            if avg_val_spearman > best_avg_val_spearman + 1e-8:
+                best_avg_val_spearman = avg_val_spearman
+                best_state = copy.deepcopy(self.model.state_dict())
+                best_epoch = epoch
+                epochs_no_improve = 0
+                
+                torch.save({
+                    'epoch': epoch,
+                    'model_state': best_state,
+                    'optimizer_state': optimizer.state_dict(),
+                    'metrics': metrics,
+                    'avg_val_spearman': avg_val_spearman
+                }, str(self.out_dir / "best_checkpoint.pt"))
+            else:
+                epochs_no_improve += 1
+            
+            # Logging
+            if epoch % 10 == 0 or epoch == 1:
+                logger.info(f"\nEpoch {epoch}/{epochs}")
+                logger.info(f"  Train Loss: {train_loss:.4f}")
+                logger.info(f"  Avg Val Spearman: {avg_val_spearman:.4f} (best: {best_avg_val_spearman:.4f})")
+                for task in self.task_names:
+                    val_sp = metrics[task]['valid']['spearman']
+                    val_rmse = metrics[task]['valid']['rmse_denorm']
+                    logger.info(f"    {task:25s}: Spearman={val_sp:.4f}, RMSE={val_rmse:.4f}")
+            
+            if epochs_no_improve >= early_stop_patience:
+                logger.info(f"\nEarly stopping at epoch {epoch}")
+                break
+        
+        # Restore best model
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+        
+        # Final evaluation and save predictions
+        logger.info("\n" + "=" * 60)
+        logger.info("FINAL EVALUATION")
+        logger.info("=" * 60)
+        
+        final_metrics = self._evaluate_all_tasks(batch_size=batch_size)
+        
+        for task_name in self.task_names:
+            task_dir = self.out_dir / task_name
+            task_dir.mkdir(parents=True, exist_ok=True)
+            
+            ds = self.task_datasets[task_name]
+            
+            # Save predictions
+            for split, graphs in [('train', ds.train), ('valid', ds.valid), ('test', ds.test)]:
+                if len(graphs) > 0:
+                    y_true, y_pred = self._predict_list(task_name, graphs, batch_size)
+                    np.save(str(task_dir / f"y_{split}.npy"), y_true)
+                    np.save(str(task_dir / f"y_pred_{split}.npy"), y_pred)
+            
+            # Save task results
+            task_results = {
+                'task_name': task_name,
+                'best_epoch': best_epoch,
+                'norm_stats': self.norm_stats[task_name],
+                'metrics': final_metrics[task_name]
+            }
+            
+            with open(str(task_dir / "results.json"), 'w') as f:
+                json.dump(task_results, f, indent=2)
+            
+            # Log results
+            logger.info(f"\n{task_name}:")
+            for split in ['train', 'valid', 'test']:
+                m = final_metrics[task_name][split]
+                logger.info(
+                    f"  {split.capitalize():5s} - Spearman: {m['spearman']:.4f}, "
+                    f"RMSE: {m['rmse_denorm']:.4f}, Pearson: {m['pearson']:.4f}"
+                )
+        
+        # Save overall results
+        overall_results = {
+            'best_epoch': best_epoch,
+            'best_avg_val_spearman': best_avg_val_spearman,
+            'history': history,
+            'final_metrics': final_metrics
+        }
+        
+        with open(str(self.out_dir / "overall_results.json"), 'w') as f:
+            json.dump(overall_results, f, indent=2)
+        
+        torch.save(self.model.state_dict(), str(self.out_dir / "final_model.pt"))
+        
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"Results saved to: {self.out_dir}")
+        logger.info(f"{'=' * 60}")
+        
+        return overall_results
+
+
+class SingleTaskFinetuneTrainer:
     """
     Trainer for single-task regression finetuning.
     
-    Trains a model on a single regression task using MSE loss.
-    Predictions are in normalized space (mean=0, std=1).
+    Simpler interface when training on a single task.
     """
     
     def __init__(
@@ -37,325 +434,29 @@ class FinetuneTrainer:
         train_graphs: List,
         valid_graphs: List,
         test_graphs: List = None,
-        batch_size: int = 64,
-        lr: float = 3e-4,
-        weight_decay: float = 1e-5,
+        norm_stats: Dict[str, float] = None,
         device: str = None,
-        checkpoint_dir: Path = None,
-        norm_stats: Dict[str, float] = None
+        out_dir: Path = None
     ):
-        """
-        Args:
-            model: MultiTaskRegressionModel
-            task_name: Name of the task
-            train_graphs: Training graphs
-            valid_graphs: Validation graphs
-            test_graphs: Test graphs (optional)
-            batch_size: Batch size
-            lr: Learning rate
-            weight_decay: L2 regularization
-            device: Device to train on
-            checkpoint_dir: Directory for checkpoints
-            norm_stats: {'mean': float, 'std': float} for denormalization
-        """
-        self.model = model
-        self.task_name = task_name
-        self.batch_size = batch_size
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.norm_stats = norm_stats or {'mean': 0.0, 'std': 1.0}
+        # Create a FinetuneDataset-like object
+        class SimpleDataset:
+            def __init__(self, train, valid, test):
+                self.train = train
+                self.valid = valid
+                self.test = test or []
         
-        self.model.to(self.device)
+        task_datasets = {task_name: SimpleDataset(train_graphs, valid_graphs, test_graphs or [])}
+        norm_stats_dict = {task_name: norm_stats or {'mean': 0.0, 'std': 1.0}}
         
-        self.optimizer = optim.Adam(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=lr,
-            weight_decay=weight_decay
-        )
-        
-        self.criterion = nn.MSELoss()
-        
-        # Create dataloaders
-        self.train_loader = create_dataloader(train_graphs, batch_size, shuffle=True)
-        self.valid_loader = create_dataloader(valid_graphs, batch_size, shuffle=False)
-        self.test_loader = create_dataloader(test_graphs, batch_size, shuffle=False) if test_graphs else None
-        
-        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
-        if self.checkpoint_dir:
-            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.history = {
-            'train_loss': [],
-            'train_rmse': [],
-            'valid_loss': [],
-            'valid_rmse': []
-        }
-    
-    def train_epoch(self) -> Tuple[float, float]:
-        """Train for one epoch."""
-        self.model.train()
-        
-        total_loss = 0.0
-        total_se = 0.0
-        n_samples = 0
-        
-        for batch in tqdm(self.train_loader, desc="Training", leave=False):
-            batch = batch.to(self.device)
-            
-            out = self.model(batch, self.task_name)
-            predictions = out['output']
-            reg_loss = out['losses']
-            
-            labels = batch.y.view(-1, 1)
-            
-            mse_loss = self.criterion(predictions, labels)
-            loss = mse_loss + reg_loss
-            
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            
-            total_loss += loss.item() * len(batch)
-            total_se += ((predictions - labels) ** 2).sum().item()
-            n_samples += len(batch)
-        
-        avg_loss = total_loss / n_samples
-        rmse = np.sqrt(total_se / n_samples)
-        
-        return avg_loss, rmse
-    
-    @torch.no_grad()
-    def evaluate(self, loader: DataLoader) -> Tuple[float, float]:
-        """Evaluate on a data loader."""
-        self.model.eval()
-        
-        total_loss = 0.0
-        total_se = 0.0
-        n_samples = 0
-        
-        for batch in loader:
-            batch = batch.to(self.device)
-            
-            out = self.model(batch, self.task_name)
-            predictions = out['output']
-            
-            labels = batch.y.view(-1, 1)
-            
-            mse_loss = self.criterion(predictions, labels)
-            
-            total_loss += mse_loss.item() * len(batch)
-            total_se += ((predictions - labels) ** 2).sum().item()
-            n_samples += len(batch)
-        
-        avg_loss = total_loss / n_samples
-        rmse = np.sqrt(total_se / n_samples)
-        
-        return avg_loss, rmse
-    
-    def train(
-        self,
-        epochs: int,
-        patience: int = 20,
-        log_interval: int = 1
-    ) -> Dict:
-        """
-        Full training loop with early stopping.
-        
-        Args:
-            epochs: Maximum number of epochs
-            patience: Early stopping patience
-            log_interval: How often to log
-            
-        Returns:
-            Training history
-        """
-        logger.info(f"Starting finetuning for {self.task_name}")
-        logger.info(f"Train: {len(self.train_loader.dataset)}, Valid: {len(self.valid_loader.dataset)}")
-        logger.info(f"Device: {self.device}")
-        
-        best_valid_rmse = float('inf')
-        patience_counter = 0
-        best_epoch = 0
-        
-        for epoch in range(1, epochs + 1):
-            # Train
-            train_loss, train_rmse = self.train_epoch()
-            
-            # Validate
-            valid_loss, valid_rmse = self.evaluate(self.valid_loader)
-            
-            # Record history
-            self.history['train_loss'].append(train_loss)
-            self.history['train_rmse'].append(train_rmse)
-            self.history['valid_loss'].append(valid_loss)
-            self.history['valid_rmse'].append(valid_rmse)
-            
-            # Log
-            if epoch % log_interval == 0:
-                # Denormalize RMSE for interpretability
-                denorm_train_rmse = train_rmse * self.norm_stats['std']
-                denorm_valid_rmse = valid_rmse * self.norm_stats['std']
-                
-                logger.info(
-                    f"Epoch {epoch}/{epochs} | "
-                    f"Train RMSE: {denorm_train_rmse:.4f} | "
-                    f"Valid RMSE: {denorm_valid_rmse:.4f}"
-                )
-            
-            # Early stopping
-            if valid_rmse < best_valid_rmse:
-                best_valid_rmse = valid_rmse
-                best_epoch = epoch
-                patience_counter = 0
-                
-                if self.checkpoint_dir:
-                    self.save_checkpoint(epoch, valid_rmse, is_best=True)
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    logger.info(f"Early stopping at epoch {epoch}")
-                    break
-        
-        # Load best model
-        if self.checkpoint_dir:
-            best_path = self.checkpoint_dir / "best_model.pt"
-            if best_path.exists():
-                self.load_checkpoint(best_path)
-        
-        # Test evaluation
-        if self.test_loader:
-            test_loss, test_rmse = self.evaluate(self.test_loader)
-            denorm_test_rmse = test_rmse * self.norm_stats['std']
-            self.history['test_rmse'] = test_rmse
-            self.history['test_rmse_denorm'] = denorm_test_rmse
-            logger.info(f"Test RMSE: {denorm_test_rmse:.4f}")
-        
-        self.history['best_epoch'] = best_epoch
-        self.history['best_valid_rmse'] = best_valid_rmse
-        
-        # Save history
-        if self.checkpoint_dir:
-            with open(self.checkpoint_dir / "history.json", 'w') as f:
-                json.dump(self.history, f, indent=2)
-        
-        return self.history
-    
-    def save_checkpoint(self, epoch: int, rmse: float, is_best: bool = False):
-        """Save model checkpoint."""
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'rmse': rmse,
-            'task_name': self.task_name,
-            'norm_stats': self.norm_stats
-        }
-        
-        if is_best:
-            path = self.checkpoint_dir / "best_model.pt"
-        else:
-            path = self.checkpoint_dir / f"checkpoint_epoch_{epoch}.pt"
-        
-        torch.save(checkpoint, path)
-    
-    def load_checkpoint(self, path: Path):
-        """Load checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        logger.info(f"Loaded best model from epoch {checkpoint['epoch']}")
-    
-    @torch.no_grad()
-    def predict(self, graphs: List, return_denorm: bool = True) -> np.ndarray:
-        """
-        Make predictions on a list of graphs.
-        
-        Args:
-            graphs: List of PyG Data objects
-            return_denorm: Whether to denormalize predictions
-            
-        Returns:
-            Numpy array of predictions
-        """
-        self.model.eval()
-        loader = create_dataloader(graphs, self.batch_size, shuffle=False)
-        
-        all_preds = []
-        for batch in loader:
-            batch = batch.to(self.device)
-            out = self.model(batch, self.task_name)
-            preds = out['output'].cpu().numpy()
-            all_preds.append(preds)
-        
-        preds = np.vstack(all_preds).flatten()
-        
-        if return_denorm:
-            preds = preds * self.norm_stats['std'] + self.norm_stats['mean']
-        
-        return preds
-
-
-def train_all_finetune_tasks(
-    model_builder,
-    finetune_datasets: Dict[str, FinetuneDataset],
-    norm_stats: Dict[str, Dict[str, float]],
-    encoder_path: Path = None,
-    output_dir: Path = None,
-    epochs: int = 150,
-    batch_size: int = 64,
-    lr: float = 3e-4,
-    patience: int = 20,
-    device: str = None
-) -> Dict[str, Dict]:
-    """
-    Train models for all finetuning tasks.
-    
-    Args:
-        model_builder: Function to build model (task_names, encoder_path) -> model
-        finetune_datasets: Dict of task_name -> FinetuneDataset
-        norm_stats: Dict of task_name -> {'mean': float, 'std': float}
-        encoder_path: Path to pretrained encoder
-        output_dir: Base output directory
-        epochs: Max epochs per task
-        batch_size: Batch size
-        lr: Learning rate
-        patience: Early stopping patience
-        device: Device
-        
-    Returns:
-        Dict of task_name -> training history
-    """
-    results = {}
-    
-    for task_name, dataset in finetune_datasets.items():
-        logger.info("=" * 60)
-        logger.info(f"Training: {task_name}")
-        logger.info("=" * 60)
-        
-        # Build model for this task
-        model = model_builder(
-            task_names=[task_name],
-            encoder_checkpoint=str(encoder_path) if encoder_path else None
-        )
-        
-        # Get checkpoint dir
-        task_output = output_dir / task_name if output_dir else None
-        
-        # Create trainer
-        trainer = FinetuneTrainer(
+        self.trainer = MultiTaskFinetuneTrainer(
             model=model,
-            task_name=task_name,
-            train_graphs=dataset.train,
-            valid_graphs=dataset.valid,
-            test_graphs=dataset.test,
-            batch_size=batch_size,
-            lr=lr,
+            task_datasets=task_datasets,
+            norm_stats=norm_stats_dict,
             device=device,
-            checkpoint_dir=task_output,
-            norm_stats=norm_stats.get(task_name, {'mean': 0.0, 'std': 1.0})
+            out_dir=out_dir
         )
-        
-        # Train
-        history = trainer.train(epochs=epochs, patience=patience)
-        results[task_name] = history
+        self.task_name = task_name
     
-    return results
+    def train(self, **kwargs) -> Dict:
+        """Train on the single task."""
+        return self.trainer.train(**kwargs)
