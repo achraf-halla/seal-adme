@@ -52,5 +52,3 @@ DEFAULT_HIDDEN_DIM = 256
 DEFAULT_NUM_LAYERS = 4
 DEFAULT_DROPOUT = 0.1
 
-# ChEMBL Aurora search terms (kept for compatibility, not used in v2)
-AURORA_SEARCH_TERMS = ["Aurora kinase A", "Aurora kinase B"]
