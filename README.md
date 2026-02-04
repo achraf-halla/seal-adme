@@ -376,7 +376,7 @@ finetune:
 
 ## References
 
-- **Musial et al. (2025)**. *Fragment-Wise Interpretability in Graph Neural Networks via Molecule Decomposition and Contribution Analysis.* — Original SEAL framework
+- **Musial et al. (2025)**. *Fragment-Wise Interpretability in Graph Neural Networks via Molecule Decomposition and Contribution Analysis.* — Original SEAL framework *https://github.com/gmum/SEAL/tree/main*
 - **Therapeutics Data Commons (TDC)**: https://tdcommons.ai/
 - **BRICS Fragmentation**: Degen et al. (2008). *On the Art of Compiling and Using 'Drug-Like' Chemical Fragment Spaces.*
 
